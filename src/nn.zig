@@ -80,7 +80,7 @@ pub fn Model(comptime LayerTypes: []const type) type {
             return self;
         }
 
-        fn recCalculateLayer(self: *const @This(), comptime layer_idx: usize, input: InputVector) LayerTypes[layer_idx].Output {
+        inline fn recCalculateLayer(self: *const @This(), comptime layer_idx: usize, input: InputVector) LayerTypes[layer_idx].Output {
             return if (layer_idx == 0)
                 self.layers[0].calculateOutputs(input)
             else
