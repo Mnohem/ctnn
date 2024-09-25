@@ -80,28 +80,28 @@ pub fn Model(comptime LayerTypes: []const type) type {
             return self;
         }
 
-        inline fn recCalculateLayer(self: *const @This(), comptime layer_idx: usize, input: InputVector) LayerTypes[layer_idx].Output {
+        inline fn recCalculateLayer(self: *const @This(), comptime layer_idx: usize, input: *const InputVector) LayerTypes[layer_idx].Output {
             return if (layer_idx == 0)
-                self.layers[0].calculateOutputs(input)
+                self.layers[0].calculateOutputs(input.*)
             else
                 self.layers[layer_idx].calculateOutputs(self.recCalculateLayer(layer_idx - 1, input));
         }
 
-        pub fn calculateOutputs(self: *const @This(), input: InputVector) OutputVector {
+        pub fn calculateOutputs(self: *const @This(), input: *const InputVector) OutputVector {
             return self.recCalculateLayer(END, input);
         }
 
-        pub fn singleLoss(self: *const @This(), input: InputVector, expected: OutputVector) NumType {
+        pub fn singleLoss(self: *const @This(), input: *const InputVector, expected: *const OutputVector) NumType {
             const output = self.calculateOutputs(input);
 
-            const result = @reduce(.Add, cost(OutputVector, output, expected));
+            const result = @reduce(.Add, cost(OutputVector, output, expected.*));
 
             return result;
         }
 
         pub fn loss(self: *const @This(), inputs: []const InputVector, expecteds: []const OutputVector) NumType {
             var total_loss: NumType = 0;
-            for (inputs, expecteds) |input, expected| {
+            for (inputs, expecteds) |*input, *expected| {
                 const sing_loss = self.singleLoss(input, expected);
                 total_loss += sing_loss;
             }
@@ -135,16 +135,9 @@ pub fn Model(comptime LayerTypes: []const type) type {
         }
 
         pub fn batchGradDescent(self: *@This(), rng: std.Random, comptime batch_size: usize, inputs: []const InputVector, expecteds: []const OutputVector, learn_rate: NumType) void {
-            var batched_inputs: [batch_size]InputVector = undefined;
-            var batched_expecteds: [batch_size]OutputVector = undefined;
+            const index = rng.intRangeLessThan(usize, 0, inputs.len - batch_size);
 
-            for (0..batch_size) |i| {
-                const index = rng.intRangeLessThan(usize, 0, inputs.len);
-                batched_inputs[i] = inputs[index];
-                batched_expecteds[i] = expecteds[index];
-            }
-
-            self.gradDescent(&batched_inputs, &batched_expecteds, learn_rate);
+            self.gradDescent(inputs[index .. batch_size + index], expecteds[index .. batch_size + index], learn_rate);
         }
     };
 }
