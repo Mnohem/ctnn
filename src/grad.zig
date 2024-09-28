@@ -1,180 +1,208 @@
 const std = @import("std");
 
-pub fn ValueManager(Data: type, one_value: Data) type {
-    const Idx = enum(u32) { _ };
+// Require caller to give a one_value for easy interop with Vectors
+pub fn ValueManager(Data: type) type {
+    const data_is_scalar = s: switch (@typeInfo(Data)) {
+        .float => true,
+        .vector => |v| switch (@typeInfo(v.child)) {
+            .float => false,
+            else => continue :s null,
+        },
+        else => @compileError(std.fmt.comptimePrint("Expected a float scalar or vector type, found {} instead", .{Data})),
+    };
+    const one: Data = if (data_is_scalar) 1 else @splat(1);
+    // const one_half: Data = one / (one + one);
+
+    // The lowest amount of bits Im willing to give to power
+    const LOWEST_POWER_SIZE = 4;
     // power operator is hidden in the unused bits of the Operator enum
     // unused bits are interpreted as a signed int to be raised to
-    const Operator = enum(i8) { plus, mul, exp, _ };
+    const Operator = enum(i8) { noop = 0, add, mul, exp, neg, _ };
     const op_without_int_size: comptime_int = @ceil(@log2(@as(comptime_float, @floatFromInt(std.meta.fields(Operator).len))));
     const size_for_int = 8 - op_without_int_size;
-    if (size_for_int <= 4) @compileError(std.fmt.comptimePrint("Operator enum is too large to store int: {d} bits left", .{size_for_int}));
-    const PowType = std.meta.Int(.signed, size_for_int);
+    if (size_for_int < LOWEST_POWER_SIZE) @compileError(std.fmt.comptimePrint("Operator enum is too large to store int: {d} bits left", .{size_for_int}));
+    const PowInt = std.meta.Int(.signed, size_for_int);
+
+    const Idx = enum(u24) { _ };
+
+    comptime std.debug.assert(@sizeOf(packed struct {
+        op: Operator,
+        idx: Idx,
+    }) == 4);
 
     return struct {
         allocator: std.mem.Allocator,
+        // indexed by Idx Type
         data_storage: std.ArrayListUnmanaged(Data),
         grad_storage: std.ArrayListUnmanaged(Data),
-        op_map: std.AutoArrayHashMapUnmanaged(Idx, Operator),
-        unary_map: std.AutoArrayHashMapUnmanaged(Idx, Idx),
-        binary_map: std.AutoArrayHashMapUnmanaged(Idx, [2]Idx),
-        // May need for operations with variable number of args
-        // extra_children_storage: std.ArrayListUnmanaged(Idx),
+        child_idx_map: std.AutoArrayHashMapUnmanaged(Idx, u24),
+        // indexed by u24 returned from child_idx_map
+        children_storage: std.ArrayListUnmanaged(ValueRef),
 
         const Self = @This();
+        // Index is crammed with Operator, meaning our index is 24 bit
+        // Thus we can only store 16,777,215 values
+        pub const ValueRef = packed struct {
+            op: Operator,
+            idx: Idx,
+        };
 
-        pub fn init(a: std.mem.Allocator) !Self {
+        pub fn init(a: std.mem.Allocator, capacity: usize) !Self {
             return Self{
                 .allocator = a,
-                .data_storage = try std.ArrayListUnmanaged(Data).initCapacity(a, 10),
-                .grad_storage = try std.ArrayListUnmanaged(Data).initCapacity(a, 10),
-                .op_map = try std.AutoArrayHashMapUnmanaged(Idx, Operator).init(a, &[_]Idx{}, &[_]Operator{}),
-                .unary_map = try std.AutoArrayHashMapUnmanaged(Idx, Idx).init(a, &[_]Idx{}, &[_]Idx{}),
-                .binary_map = try std.AutoArrayHashMapUnmanaged(Idx, [2]Idx).init(a, &[_]Idx{}, &[_][2]Idx{}),
+                .data_storage = try std.ArrayListUnmanaged(Data).initCapacity(a, capacity),
+                .grad_storage = try std.ArrayListUnmanaged(Data).initCapacity(a, capacity),
+                .child_idx_map = try std.AutoArrayHashMapUnmanaged(Idx, u24).init(a, &[_]Idx{}, &[_]u24{}),
+                .children_storage = try std.ArrayListUnmanaged(ValueRef).initCapacity(a, capacity),
             };
         }
         pub fn deinit(self: *Self) void {
             self.data_storage.deinit(self.allocator);
             self.grad_storage.deinit(self.allocator);
-            self.op_map.deinit(self.allocator);
-            self.unary_map.deinit(self.allocator);
-            self.binary_map.deinit(self.allocator);
+            self.child_idx_map.deinit(self.allocator);
+            self.children_storage.deinit(self.allocator);
         }
-        pub fn new(self: *Self, data: Data) Idx {
+        pub fn new(self: *Self, data: Data) ValueRef {
             self.data_storage.append(self.allocator, data) catch |err| {
                 std.debug.panic("Failed to store data {}: {}", .{ data, err });
             };
-            errdefer _ = self.data_storage.pop();
 
             self.grad_storage.append(self.allocator, std.mem.zeroes(Data)) catch |err| {
                 std.debug.panic("Failed to zero gradient {}: {}", .{ data, err });
             };
-            errdefer _ = self.grad_storage.pop();
 
-            return @enumFromInt(self.data_storage.items.len - 1);
+            return .{
+                .op = .noop,
+                .idx = @enumFromInt(self.data_storage.items.len - 1),
+            };
         }
         // Idx is always valid assuming the caller did cast into it
-        fn getData(self: *const Self, idx: Idx) Data {
-            return self.data_storage.items[@intFromEnum(idx)];
+        fn getData(self: *const Self, ref: ValueRef) Data {
+            return self.data_storage.items[@intFromEnum(ref.idx)];
         }
-        fn getGrad(self: *const Self, idx: Idx) Data {
-            return self.grad_storage.items[@intFromEnum(idx)];
+        fn getGrad(self: *const Self, ref: ValueRef) Data {
+            return self.grad_storage.items[@intFromEnum(ref.idx)];
         }
-        fn bin(self: *Self, id1: Idx, id2: Idx, data: Data, op: Operator) !Idx {
-            const new_idx = self.new(data);
+        fn newExpr(self: *Self, op: Operator, data: Data, children: []const ValueRef) !ValueRef {
+            var new_ref = self.new(data);
             errdefer {
                 _ = self.data_storage.pop();
                 _ = self.grad_storage.pop();
             }
+            new_ref.op = op;
 
-            try self.op_map.put(self.allocator, new_idx, op);
-            errdefer _ = self.op_map.swapRemove(new_idx);
-            try self.binary_map.put(self.allocator, new_idx, [_]Idx{ id1, id2 });
+            try self.child_idx_map.put(self.allocator, new_ref.idx, @intCast(self.children_storage.items.len));
+            errdefer _ = self.child_idx_map.swapRemove(new_ref.idx);
+            try self.children_storage.appendSlice(self.allocator, children);
 
-            return new_idx;
-        }
-        fn un(self: *Self, idx: Idx, data: Data, op: Operator) !Idx {
-            const new_idx = self.new(data);
-            errdefer {
-                _ = self.data_storage.pop();
-                _ = self.grad_storage.pop();
-            }
-
-            try self.op_map.put(self.allocator, new_idx, op);
-            errdefer _ = self.op_map.swapRemove(new_idx);
-            try self.unary_map.put(self.allocator, new_idx, idx);
-            errdefer _ = self.binary_map.swapRemove(new_idx);
-
-            return new_idx;
+            return new_ref;
         }
 
-        pub fn add(self: *Self, id1: Idx, id2: Idx) Idx {
-            return self.bin(id1, id2, self.getData(id1) + self.getData(id2), .plus) catch |err| {
-                std.debug.panic("Failed to add indices {d} and {d}: {}", .{ id1, id2, err });
+        pub fn add(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
+            return self.newExpr(.add, self.getData(id1) + self.getData(id2), &[_]ValueRef{ id1, id2 }) catch |err| {
+                std.debug.panic("Failed to add refs {} and {}: {}", .{ id1, id2, err });
             };
         }
-        pub fn mul(self: *Self, id1: Idx, id2: Idx) Idx {
-            return self.bin(id1, id2, self.getData(id1) * self.getData(id2), .mul) catch |err| {
-                std.debug.panic("Failed to multiply indices {d} and {d}: {}", .{ id1, id2, err });
+        pub fn mul(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
+            return self.newExpr(.mul, self.getData(id1) * self.getData(id2), &[_]ValueRef{ id1, id2 }) catch |err| {
+                std.debug.panic("Failed to add refs {} and {}: {}", .{ id1, id2, err });
             };
         }
-        pub fn div(self: *Self, id1: Idx, id2: Idx) Idx {
-            const recip = self.pow(id2, -1);
-
-            return self.mul(id1, recip);
+        pub inline fn div(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
+            return self.mul(id1, self.powi(id2, -1));
         }
         // pow cannot be raised to a Value power because this changes derivs, we will have more complications
         // Though we still need to hold the num for backward, so we cram it into the Operator enum
-        // PowType is type ix where x is the number of unused bits in Operator
-        // We cant store PowType as a Value since it can't be a vector
-        pub fn pow(self: *Self, idx: Idx, num: PowType) Idx {
-            const data = self.getData(idx);
-            var result: Data = data;
-            for (0..@abs(num) - 1) |_| {
+        // PowInt is type ix where x is the number of unused bits in Operator
+        // We cant store PowInt as a Value since it can't be a vector and we cant rely on Data being a scalar
+        pub fn powi(self: *Self, ref: ValueRef, num: PowInt) ValueRef {
+            const data = self.getData(ref);
+            var result: Data = one;
+            for (0..@abs(num)) |_| {
                 result *= data;
             }
-            result = if (std.math.sign(num) == -1) one_value / result else if (num == 0) one_value else result;
-            return self.un(idx, result, @enumFromInt(num << op_without_int_size)) catch |err| {
-                std.debug.panic("Failed to raise index {d} to the power of {d}: {}", .{ idx, num, err });
+            result = if (std.math.sign(num) == -1) one / result else result;
+            return self.newExpr(@enumFromInt(@as(i8, num) << op_without_int_size), result, &[_]ValueRef{ref}) catch |err| {
+                std.debug.panic("Failed to raise ref {} to the power of {d}: {}", .{ ref, num, err });
             };
         }
-        pub fn exp(self: *Self, idx: Idx) Idx {
-            return self.un(idx, @exp(self.getData(idx)), .exp) catch |err| {
-                std.debug.panic("Failed to exponentiate index {d}: {}", .{ idx, err });
+        pub fn exp(self: *Self, ref: ValueRef) ValueRef {
+            return self.newExpr(.exp, @exp(self.getData(ref)), &[_]ValueRef{ref}) catch |err| {
+                std.debug.panic("Failed to exponentiate ref {}: {}", .{ ref, err });
             };
         }
+        pub fn neg(self: *Self, ref: ValueRef) ValueRef {
+            return self.newExpr(.neg, -self.getData(ref), &[_]ValueRef{ref}) catch |err| {
+                std.debug.panic("Failed to negate ref {}: {}", .{ ref, err });
+            };
+        }
+        pub inline fn sub(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
+            return self.add(id1, self.neg(id2));
+        }
 
-        pub fn backward(self: *Self, idx: Idx) void {
-            self.grad_storage.items[@intFromEnum(idx)] = one_value;
+        // pub fn eval(self: *Self, expr: []const u8, variables: anytype) Idx {
+        //     return @import("eval.zig").eval(Data, self, expr, variables);
+        // }
 
-            var child_list = std.ArrayList(Idx).init(self.allocator);
+        // can be optimized to not visit leaves
+        pub fn backward(self: *Self, ref: ValueRef) void {
+            self.grad_storage.items[@intFromEnum(ref.idx)] = one;
+
+            var child_list = std.ArrayList(ValueRef).init(self.allocator);
             defer child_list.deinit();
 
-            child_list.append(idx) catch |err| {
-                std.debug.panic("Failed to calculate backward for {d}: {}", .{ idx, err });
+            child_list.append(ref) catch |err| {
+                std.debug.panic("Failed to calculate backward for {}: {}", .{ ref, err });
             };
 
             var i: usize = 0;
             while (i < child_list.items.len) : (i += 1) {
                 const curr = child_list.items[i];
 
-                if (self.op_map.get(curr)) |op| {
-                    const curr_grad = self.grad_storage.items[@intFromEnum(curr)];
-                    const to_add = blk: switch (op) {
-                        .plus => {
-                            const children = self.binary_map.get(curr).?;
-                            self.grad_storage.items[@intFromEnum(children[0])] += curr_grad;
-                            self.grad_storage.items[@intFromEnum(children[1])] += curr_grad;
+                if (curr.op != .noop) {
+                    const curr_grad = self.getGrad(curr);
+                    const child_idx: usize = @intCast(self.child_idx_map.get(curr.idx).?);
 
-                            break :blk &children;
+                    const to_add = blk: switch (curr.op) {
+                        .noop => unreachable,
+                        .add => {
+                            const children = self.children_storage.items[child_idx .. child_idx + 2];
+                            self.grad_storage.items[@intFromEnum(children[0].idx)] += curr_grad;
+                            self.grad_storage.items[@intFromEnum(children[1].idx)] += curr_grad;
+
+                            break :blk children;
                         },
                         .mul => {
-                            const children = self.binary_map.get(curr).?;
-                            const d0 = &self.data_storage.items[@intFromEnum(children[0])];
-                            const d1 = &self.data_storage.items[@intFromEnum(children[1])];
+                            const children = self.children_storage.items[child_idx .. child_idx + 2];
+                            self.grad_storage.items[@intFromEnum(children[0].idx)] += self.getData(children[1]) * curr_grad;
+                            self.grad_storage.items[@intFromEnum(children[1].idx)] += self.getData(children[0]) * curr_grad;
 
-                            self.grad_storage.items[@intFromEnum(children[0])] += d1.* * curr_grad;
-                            self.grad_storage.items[@intFromEnum(children[1])] += d0.* * curr_grad;
-
-                            break :blk &children;
+                            break :blk children;
                         },
                         .exp => {
-                            const child = self.unary_map.get(curr).?;
-                            self.grad_storage.items[@intFromEnum(child)] += self.getData(curr) * curr_grad;
+                            const child = self.children_storage.items[child_idx .. child_idx + 1];
+                            self.grad_storage.items[@intFromEnum(child[0].idx)] += self.getData(curr) * curr_grad;
 
-                            break :blk &[1]Idx{child};
+                            break :blk child;
+                        },
+                        .neg => {
+                            const child = self.children_storage.items[child_idx .. child_idx + 1];
+                            self.grad_storage.items[@intFromEnum(child[0].idx)] -= curr_grad;
+
+                            break :blk child;
                         },
                         //.pow
                         _ => {
-                            const child = self.unary_map.get(curr).?;
-                            const num = @as(i8, @intFromEnum(op)) >> op_without_int_size;
-                            const data_num: Data = if (Data == f32 or Data == f64) @floatFromInt(num) else @splat(@floatFromInt(num));
-                            self.grad_storage.items[@intFromEnum(child)] += data_num * (self.getData(curr) / self.getData(child)) * curr_grad;
+                            const child = self.children_storage.items[child_idx .. child_idx + 1];
+                            const num = @as(PowInt, @intCast(@intFromEnum(curr.op) >> op_without_int_size));
+                            const data_num: Data = if (data_is_scalar) @floatFromInt(num) else @splat(@floatFromInt(num));
+                            self.grad_storage.items[@intFromEnum(child[0].idx)] += data_num * (self.getData(curr) / self.getData(child[0])) * curr_grad;
 
-                            break :blk &[1]Idx{child};
+                            break :blk child;
                         },
                     };
                     child_list.appendSlice(to_add) catch |err| {
-                        std.debug.panic("Failed to calculate backward for {d} on idx {d}: {}", .{ idx, curr, err });
+                        std.debug.panic("Failed to calculate backward for {} at {}: {}", .{ ref, curr, err });
                     };
                 }
             }
@@ -185,7 +213,7 @@ pub fn ValueManager(Data: type, one_value: Data) type {
 const APPROX = 0.001;
 
 test "ValueManager Operations and Duplicate Terms Test" {
-    var vm = try ValueManager(f32, 1).init(std.testing.allocator);
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
     defer vm.deinit();
 
     const a = vm.new(1);
@@ -215,8 +243,23 @@ test "ValueManager Operations and Duplicate Terms Test" {
     try std.testing.expectApproxEqAbs(12, vm.getGrad(a), APPROX);
 }
 
+test "ValueManager Negation Test" {
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
+    defer vm.deinit();
+
+    const a = vm.new(1);
+    const b = vm.new(2);
+
+    const d = vm.neg(b);
+    const e = vm.add(a, d);
+    try std.testing.expectApproxEqAbs(-1, vm.getData(e), APPROX);
+
+    vm.backward(e);
+    try std.testing.expectApproxEqAbs(-1, vm.getGrad(b), APPROX);
+}
+
 test "ValueManager Exponentiation Test" {
-    var vm = try ValueManager(f32, 1).init(std.testing.allocator);
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
     defer vm.deinit();
 
     const a = vm.new(@log(2.0));
@@ -235,16 +278,16 @@ test "ValueManager Exponentiation Test" {
 }
 
 test "ValueManager Power Raising Test" {
-    var vm = try ValueManager(f32, 1).init(std.testing.allocator);
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
     defer vm.deinit();
 
     const a = vm.new(2);
     const b = vm.new(3);
 
-    const c = vm.pow(a, 3);
+    const c = vm.powi(a, 3);
     try std.testing.expectApproxEqAbs(8, vm.getData(c), APPROX);
 
-    const d = vm.pow(b, 2);
+    const d = vm.powi(b, 2);
     try std.testing.expectApproxEqAbs(9, vm.getData(d), APPROX);
 
     const e = vm.add(c, d);
@@ -256,13 +299,13 @@ test "ValueManager Power Raising Test" {
 }
 
 test "ValueManager Division Test" {
-    var vm = try ValueManager(f32, 1).init(std.testing.allocator);
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
     defer vm.deinit();
 
     const a = vm.new(2);
     const b = vm.new(3);
 
-    const c = vm.pow(a, -1);
+    const c = vm.powi(a, -1);
     try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
 
     const d = vm.div(b, a);
@@ -277,14 +320,14 @@ test "ValueManager Division Test" {
 }
 
 test "ValueManager Vector Test" {
-    var vm = try ValueManager(@Vector(4, f32), @splat(1)).init(std.testing.allocator);
+    var vm = try ValueManager(@Vector(4, f32)).init(std.testing.allocator, 10);
     defer vm.deinit();
 
     const a = vm.new([_]f32{ 1, 2, 3, 4 });
     const b = vm.new(@splat(5));
     const c = vm.new([_]f32{ 0.09, 2, 10, 1.1 });
 
-    const d = vm.pow(a, 2);
+    const d = vm.powi(a, 2);
     try std.testing.expectApproxEqAbs(1, vm.getData(d)[0], APPROX);
     try std.testing.expectApproxEqAbs(4, vm.getData(d)[1], APPROX);
     try std.testing.expectApproxEqAbs(9, vm.getData(d)[2], APPROX);
@@ -320,4 +363,19 @@ test "ValueManager Vector Test" {
     try std.testing.expectApproxEqAbs(df_da[1], vm.getGrad(a)[1], APPROX);
     try std.testing.expectApproxEqAbs(df_da[2], vm.getGrad(a)[2], APPROX);
     try std.testing.expectApproxEqAbs(df_da[3], vm.getGrad(a)[3], APPROX);
+}
+
+test "ValueManager Square Test" {
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
+    defer vm.deinit();
+
+    const a = vm.new(2);
+
+    const b = vm.powi(a, 2);
+    // try std.testing.expectApproxEqAbs(4, vm.getData(b), APPROX);
+    try std.testing.expectApproxEqAbs(4, vm.getData(b), APPROX);
+
+    vm.backward(b);
+
+    try std.testing.expectApproxEqAbs(4, vm.getGrad(a), APPROX);
 }
