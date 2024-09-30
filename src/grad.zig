@@ -140,10 +140,13 @@ pub fn ValueManager(Data: type) type {
             return self.add(id1, self.neg(id2));
         }
 
-        // pub fn eval(self: *Self, expr: []const u8, variables: anytype) Idx {
-        //     return @import("eval.zig").eval(Data, self, expr, variables);
-        // }
+        pub fn eval(self: *Self, comptime expr: []const u8, variables: anytype) !@import("eval.zig").VarRefs(@TypeOf(variables), ValueRef) {
+            return @import("eval.zig").parse(Data, self, expr, variables);
+        }
 
+        pub fn forward(self: *const Self, ref: ValueRef) Data {
+            return self.getData(ref);
+        }
         // can be optimized to not visit leaves
         pub fn backward(self: *Self, ref: ValueRef) void {
             self.grad_storage.items[@intFromEnum(ref.idx)] = one;
@@ -378,4 +381,19 @@ test "ValueManager Square Test" {
     vm.backward(b);
 
     try std.testing.expectApproxEqAbs(4, vm.getGrad(a), APPROX);
+}
+
+test "ValueManager Power of Zero Test" {
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
+    defer vm.deinit();
+
+    const a = vm.new(2);
+
+    const b = vm.powi(a, 0);
+    // try std.testing.expectApproxEqAbs(4, vm.getData(b), APPROX);
+    try std.testing.expectApproxEqAbs(1, vm.getData(b), APPROX);
+
+    vm.backward(b);
+
+    try std.testing.expectApproxEqAbs(0, vm.getGrad(a), APPROX);
 }
