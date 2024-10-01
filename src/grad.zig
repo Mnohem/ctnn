@@ -76,11 +76,13 @@ pub fn ValueManager(Data: type) type {
                 .idx = @enumFromInt(self.data_storage.items.len - 1),
             };
         }
-        // Idx is always valid assuming the caller did cast into it
-        fn getData(self: *const Self, ref: ValueRef) Data {
+        pub fn getDataPtr(self: *const Self, ref: ValueRef) *Data {
+            return &self.data_storage.items[@intFromEnum(ref.idx)];
+        }
+        pub fn getData(self: *const Self, ref: ValueRef) Data {
             return self.data_storage.items[@intFromEnum(ref.idx)];
         }
-        fn getGrad(self: *const Self, ref: ValueRef) Data {
+        pub fn getGrad(self: *const Self, ref: ValueRef) Data {
             return self.grad_storage.items[@intFromEnum(ref.idx)];
         }
         fn newExpr(self: *Self, op: Operator, data: Data, children: []const ValueRef) !ValueRef {
@@ -144,8 +146,48 @@ pub fn ValueManager(Data: type) type {
             return @import("eval.zig").parse(Data, self, expr, variables);
         }
 
-        pub fn forward(self: *const Self, ref: ValueRef) Data {
-            return self.getData(ref);
+        pub fn zeroGrad(self: *Self) void {
+            @memset(self.grad_storage.items, std.mem.zeroes(Data));
+        }
+
+        fn recalculate(self: *Self, ref: ValueRef) void {
+            if (ref.op == .noop) return;
+            const c = self.children_storage.items[self.child_idx_map.get(ref.idx).?..];
+
+            switch (ref.op) {
+                .noop => unreachable,
+                .add, .mul => {
+                    self.recalculate(c[0]);
+                    self.recalculate(c[1]);
+                },
+                _ => self.recalculate(c[0]),
+                .exp, .neg => self.recalculate(c[0]),
+            }
+
+            const data: *Data = &self.data_storage.items[@intFromEnum(ref.idx)];
+
+            data.* = switch (ref.op) {
+                .noop => unreachable,
+                .add => self.getData(c[0]) + self.getData(c[1]),
+                .mul => self.getData(c[0]) * self.getData(c[1]),
+                .exp => @exp(self.getData(c[0])),
+                .neg => -self.getData(c[0]),
+                _ => blk: {
+                    const num = @as(PowInt, @intCast(@intFromEnum(ref.op) >> op_without_int_size));
+                    const d = self.getData(c[0]);
+                    var result: Data = one;
+                    for (0..@abs(num)) |_| {
+                        result *= d;
+                    }
+                    break :blk if (std.math.sign(num) == -1) one / result else result;
+                },
+            };
+        }
+
+        // recalculate is currently the naive, recursive solution
+        // Want to find a better, iterative method
+        pub fn forward(self: *Self, ref: ValueRef) void {
+            return self.recalculate(ref);
         }
         // can be optimized to not visit leaves
         pub fn backward(self: *Self, ref: ValueRef) void {
@@ -164,47 +206,38 @@ pub fn ValueManager(Data: type) type {
 
                 if (curr.op != .noop) {
                     const curr_grad = self.getGrad(curr);
-                    const child_idx: usize = @intCast(self.child_idx_map.get(curr.idx).?);
+                    const children = self.children_storage.items[self.child_idx_map.get(curr.idx).?..];
 
-                    const to_add = blk: switch (curr.op) {
+                    switch (curr.op) {
                         .noop => unreachable,
                         .add => {
-                            const children = self.children_storage.items[child_idx .. child_idx + 2];
                             self.grad_storage.items[@intFromEnum(children[0].idx)] += curr_grad;
                             self.grad_storage.items[@intFromEnum(children[1].idx)] += curr_grad;
-
-                            break :blk children;
                         },
                         .mul => {
-                            const children = self.children_storage.items[child_idx .. child_idx + 2];
                             self.grad_storage.items[@intFromEnum(children[0].idx)] += self.getData(children[1]) * curr_grad;
                             self.grad_storage.items[@intFromEnum(children[1].idx)] += self.getData(children[0]) * curr_grad;
-
-                            break :blk children;
                         },
                         .exp => {
-                            const child = self.children_storage.items[child_idx .. child_idx + 1];
-                            self.grad_storage.items[@intFromEnum(child[0].idx)] += self.getData(curr) * curr_grad;
-
-                            break :blk child;
+                            self.grad_storage.items[@intFromEnum(children[0].idx)] += self.getData(curr) * curr_grad;
                         },
                         .neg => {
-                            const child = self.children_storage.items[child_idx .. child_idx + 1];
-                            self.grad_storage.items[@intFromEnum(child[0].idx)] -= curr_grad;
-
-                            break :blk child;
+                            self.grad_storage.items[@intFromEnum(children[0].idx)] -= curr_grad;
                         },
                         //.pow
                         _ => {
-                            const child = self.children_storage.items[child_idx .. child_idx + 1];
                             const num = @as(PowInt, @intCast(@intFromEnum(curr.op) >> op_without_int_size));
                             const data_num: Data = if (data_is_scalar) @floatFromInt(num) else @splat(@floatFromInt(num));
-                            self.grad_storage.items[@intFromEnum(child[0].idx)] += data_num * (self.getData(curr) / self.getData(child[0])) * curr_grad;
-
-                            break :blk child;
+                            self.grad_storage.items[@intFromEnum(children[0].idx)] += data_num * (self.getData(curr) / self.getData(children[0])) * curr_grad;
                         },
+                    }
+                    const children_len: usize = switch (curr.op) {
+                        .noop => unreachable,
+                        .exp, .neg => 1,
+                        .add, .mul => 2,
+                        _ => 1,
                     };
-                    child_list.appendSlice(to_add) catch |err| {
+                    child_list.appendSlice(children[0..children_len]) catch |err| {
                         std.debug.panic("Failed to calculate backward for {} at {}: {}", .{ ref, curr, err });
                     };
                 }
@@ -396,4 +429,66 @@ test "ValueManager Power of Zero Test" {
     vm.backward(b);
 
     try std.testing.expectApproxEqAbs(0, vm.getGrad(a), APPROX);
+}
+
+test "ValueManager Recalculate Test" {
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
+    defer vm.deinit();
+
+    const a = vm.new(2);
+    const b = vm.new(3);
+
+    const c = vm.powi(a, -1);
+    try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
+
+    const d = vm.div(b, a);
+    try std.testing.expectApproxEqAbs(1.5, vm.getData(d), APPROX);
+
+    const e = vm.mul(c, d);
+    try std.testing.expectApproxEqAbs(0.75, vm.getData(e), APPROX);
+
+    vm.recalculate(c);
+    vm.recalculate(d);
+    vm.recalculate(e);
+
+    try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
+    try std.testing.expectApproxEqAbs(1.5, vm.getData(d), APPROX);
+    try std.testing.expectApproxEqAbs(0.75, vm.getData(e), APPROX);
+
+    vm.backward(e);
+    try std.testing.expectApproxEqAbs(-0.75, vm.getGrad(a), APPROX);
+    try std.testing.expectApproxEqAbs(0.25, vm.getGrad(b), APPROX);
+}
+
+test "ValueManager forward Test" {
+    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
+    defer vm.deinit();
+
+    const a = vm.new(2);
+    const b = vm.new(3);
+
+    const c = vm.powi(a, -1);
+    try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
+
+    const d = vm.div(b, a);
+    try std.testing.expectApproxEqAbs(1.5, vm.getData(d), APPROX);
+
+    const e = vm.mul(c, d);
+    try std.testing.expectApproxEqAbs(0.75, vm.getData(e), APPROX);
+
+    vm.backward(e);
+    try std.testing.expectApproxEqAbs(-0.75, vm.getGrad(a), APPROX);
+    try std.testing.expectApproxEqAbs(0.25, vm.getGrad(b), APPROX);
+
+    vm.getDataPtr(a).* = 1;
+    vm.zeroGrad();
+
+    vm.forward(e);
+    try std.testing.expectApproxEqAbs(1, vm.getData(c), APPROX);
+    try std.testing.expectApproxEqAbs(3, vm.getData(d), APPROX);
+    try std.testing.expectApproxEqAbs(3, vm.getData(e), APPROX);
+
+    vm.backward(e);
+    try std.testing.expectApproxEqAbs(-6, vm.getGrad(a), APPROX);
+    try std.testing.expectApproxEqAbs(1, vm.getGrad(b), APPROX);
 }
