@@ -3,7 +3,7 @@ const std = @import("std");
 // power operator is hidden in the unused (_) bits of the Operator enum
 // unused bits are interpreted as a signed int to be raised to
 // .external means this value came from an operation in ManyValueManager
-const Operator = enum(i8) { noop = 0, external, add, mul, exp, neg, _ };
+const Operator = enum(i8) { noop, add, mul, exp, neg, external, _ };
 const Idx = enum(u24) { _ };
 // Index is crammed with Operator, meaning our index is 24 bit
 // Thus we can only store 16,777,215 values
@@ -204,7 +204,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
             while (i < child_list.items.len) : (i += 1) {
                 const curr = child_list.items[i];
 
-                if (curr.op != .noop or curr.op != .external) {
+                if (curr.op != .noop and curr.op != .external) {
                     const curr_grad = self.getGrad(curr);
                     const children = self.children_storage.items[self.child_idx_map.get(curr.idx).?..];
 

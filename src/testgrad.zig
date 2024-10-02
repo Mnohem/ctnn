@@ -11,7 +11,12 @@ test "ValueManager Operations and Duplicate Terms Test" {
     const a = vm.new(1);
     const b = vm.new(2);
     const c = vm.new(3);
-
+    try std.testing.expectEqual(.noop, a.op);
+    try std.testing.expectEqual(.noop, b.op);
+    try std.testing.expectEqual(.noop, c.op);
+    try std.testing.expectEqual(0b00000000, @as(i8, @intFromEnum(a.op)));
+    try std.testing.expectEqual(0b00000000, @as(i8, @intFromEnum(b.op)));
+    try std.testing.expectEqual(0b00000000, @as(i8, @intFromEnum(c.op)));
     // f = c * e
     //   = c * ad
     //   = ca(a + b)
@@ -19,11 +24,18 @@ test "ValueManager Operations and Duplicate Terms Test" {
     //f'a= 2ac + bc [a := 1, b := 2, c := 3]
     const d = vm.add(a, b);
     try std.testing.expectEqual(vm.getData(c), vm.getData(d));
+    try std.testing.expectEqual(.add, d.op);
+    try std.testing.expectEqual(0b00000001, @as(i8, @intFromEnum(d.op)));
 
     const e = vm.mul(a, d);
+    try std.testing.expectEqual(.mul, e.op);
+    try std.testing.expectEqual(0b00000010, @as(i8, @intFromEnum(e.op)));
     try std.testing.expectEqual(vm.getData(c), vm.getData(e));
 
     const f = vm.mul(c, e);
+    try std.testing.expectEqual(.mul, f.op);
+    try std.testing.expectEqual(0b00000010, @as(i8, @intFromEnum(f.op)));
+
     vm.backward(f);
     try std.testing.expectApproxEqAbs(9, vm.getData(f), APPROX);
 
