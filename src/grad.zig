@@ -1,58 +1,55 @@
 const std = @import("std");
 
+// power operator is hidden in the unused (_) bits of the Operator enum
+// unused bits are interpreted as a signed int to be raised to
+// .external means this value came from an operation in ManyValueManager
+const Operator = enum(i8) { noop = 0, external, add, mul, exp, neg, _ };
+const Idx = enum(u24) { _ };
+// Index is crammed with Operator, meaning our index is 24 bit
+// Thus we can only store 16,777,215 values
+pub const ValueRef = packed struct {
+    op: Operator,
+    idx: Idx,
+};
 // Require caller to give a one_value for easy interop with Vectors
-pub fn ValueManager(Data: type) type {
-    const data_is_scalar = s: switch (@typeInfo(Data)) {
-        .float => true,
-        .vector => |v| switch (@typeInfo(v.child)) {
-            .float => false,
-            else => continue :s null,
-        },
-        else => @compileError(std.fmt.comptimePrint("Expected a float scalar or vector type, found {} instead", .{Data})),
-    };
+pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
+    switch (@typeInfo(Scalar)) {
+        .float => {},
+        else => @compileError(std.fmt.comptimePrint("Expected a float scalar type, found {} instead", .{Scalar})),
+    }
+    const data_is_scalar = vector_size == 0;
+    const Data = if (data_is_scalar) Scalar else @Vector(vector_size, Scalar);
     const one: Data = if (data_is_scalar) 1 else @splat(1);
     // const one_half: Data = one / (one + one);
 
-    // The lowest amount of bits Im willing to give to power
+    // The lowest amount of bits Im willing to give to the power operation
     const LOWEST_POWER_SIZE = 4;
-    // power operator is hidden in the unused bits of the Operator enum
-    // unused bits are interpreted as a signed int to be raised to
-    const Operator = enum(i8) { noop = 0, add, mul, exp, neg, _ };
     const op_without_int_size: comptime_int = @ceil(@log2(@as(comptime_float, @floatFromInt(std.meta.fields(Operator).len))));
     const size_for_int = 8 - op_without_int_size;
     if (size_for_int < LOWEST_POWER_SIZE) @compileError(std.fmt.comptimePrint("Operator enum is too large to store int: {d} bits left", .{size_for_int}));
     const PowInt = std.meta.Int(.signed, size_for_int);
 
-    const Idx = enum(u24) { _ };
-
-    comptime std.debug.assert(@sizeOf(packed struct {
-        op: Operator,
-        idx: Idx,
-    }) == 4);
+    comptime std.debug.assert(@sizeOf(ValueRef) == 4);
 
     return struct {
         allocator: std.mem.Allocator,
         // indexed by Idx Type
         data_storage: std.ArrayListUnmanaged(Data),
         grad_storage: std.ArrayListUnmanaged(Data),
-        child_idx_map: std.AutoArrayHashMapUnmanaged(Idx, u24),
-        // indexed by u24 returned from child_idx_map
+        child_idx_map: std.AutoArrayHashMapUnmanaged(Idx, u32),
+        // indexed by u32 returned from child_idx_map
+        // children_storage could theoretically have a larger length than data/grad_storage since we store
+        // external ValueRefs as well
         children_storage: std.ArrayListUnmanaged(ValueRef),
 
         const Self = @This();
-        // Index is crammed with Operator, meaning our index is 24 bit
-        // Thus we can only store 16,777,215 values
-        pub const ValueRef = packed struct {
-            op: Operator,
-            idx: Idx,
-        };
 
         pub fn init(a: std.mem.Allocator, capacity: usize) !Self {
             return Self{
                 .allocator = a,
                 .data_storage = try std.ArrayListUnmanaged(Data).initCapacity(a, capacity),
-                .grad_storage = try std.ArrayListUnmanaged(Data).initCapacity(a, capacity),
-                .child_idx_map = try std.AutoArrayHashMapUnmanaged(Idx, u24).init(a, &[_]Idx{}, &[_]u24{}),
+                .grad_storage = std.ArrayListUnmanaged(Data){ .items = &[_]Data{}, .capacity = 0 },
+                .child_idx_map = try std.AutoArrayHashMapUnmanaged(Idx, u32).init(a, &[_]Idx{}, &[_]u32{}),
                 .children_storage = try std.ArrayListUnmanaged(ValueRef).initCapacity(a, capacity),
             };
         }
@@ -67,10 +64,6 @@ pub fn ValueManager(Data: type) type {
                 std.debug.panic("Failed to store data {}: {}", .{ data, err });
             };
 
-            self.grad_storage.append(self.allocator, std.mem.zeroes(Data)) catch |err| {
-                std.debug.panic("Failed to zero gradient {}: {}", .{ data, err });
-            };
-
             return .{
                 .op = .noop,
                 .idx = @enumFromInt(self.data_storage.items.len - 1),
@@ -82,6 +75,7 @@ pub fn ValueManager(Data: type) type {
         pub fn getData(self: *const Self, ref: ValueRef) Data {
             return self.data_storage.items[@intFromEnum(ref.idx)];
         }
+        // Calling this function is only valid after using backward
         pub fn getGrad(self: *const Self, ref: ValueRef) Data {
             return self.grad_storage.items[@intFromEnum(ref.idx)];
         }
@@ -89,7 +83,6 @@ pub fn ValueManager(Data: type) type {
             var new_ref = self.new(data);
             errdefer {
                 _ = self.data_storage.pop();
-                _ = self.grad_storage.pop();
             }
             new_ref.op = op;
 
@@ -107,10 +100,10 @@ pub fn ValueManager(Data: type) type {
         }
         pub fn mul(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
             return self.newExpr(.mul, self.getData(id1) * self.getData(id2), &[_]ValueRef{ id1, id2 }) catch |err| {
-                std.debug.panic("Failed to add refs {} and {}: {}", .{ id1, id2, err });
+                std.debug.panic("Failed to multiply refs {} and {}: {}", .{ id1, id2, err });
             };
         }
-        pub inline fn div(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
+        pub fn div(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
             return self.mul(id1, self.powi(id2, -1));
         }
         // pow cannot be raised to a Value power because this changes derivs, we will have more complications
@@ -138,7 +131,7 @@ pub fn ValueManager(Data: type) type {
                 std.debug.panic("Failed to negate ref {}: {}", .{ ref, err });
             };
         }
-        pub inline fn sub(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
+        pub fn sub(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
             return self.add(id1, self.neg(id2));
         }
 
@@ -151,11 +144,11 @@ pub fn ValueManager(Data: type) type {
         }
 
         fn recalculate(self: *Self, ref: ValueRef) void {
-            if (ref.op == .noop) return;
+            if (ref.op == .noop or ref.op == .external) return;
             const c = self.children_storage.items[self.child_idx_map.get(ref.idx).?..];
 
             switch (ref.op) {
-                .noop => unreachable,
+                .noop, .external => unreachable,
                 .add, .mul => {
                     self.recalculate(c[0]);
                     self.recalculate(c[1]);
@@ -167,7 +160,7 @@ pub fn ValueManager(Data: type) type {
             const data: *Data = &self.data_storage.items[@intFromEnum(ref.idx)];
 
             data.* = switch (ref.op) {
-                .noop => unreachable,
+                .noop, .external => unreachable,
                 .add => self.getData(c[0]) + self.getData(c[1]),
                 .mul => self.getData(c[0]) * self.getData(c[1]),
                 .exp => @exp(self.getData(c[0])),
@@ -190,8 +183,15 @@ pub fn ValueManager(Data: type) type {
             return self.recalculate(ref);
         }
         // can be optimized to not visit leaves
-        pub fn backward(self: *Self, ref: ValueRef) void {
-            self.grad_storage.items[@intFromEnum(ref.idx)] = one;
+        pub fn backwardWithGrad(self: *Self, ref: ValueRef, grad: Data) void {
+            if (self.grad_storage.items.len != self.data_storage.items.len) {
+                self.grad_storage.resize(self.allocator, self.data_storage.items.len) catch |err| {
+                    std.debug.panic("Failed to resize gradient: {}", .{err});
+                };
+                self.zeroGrad();
+            }
+
+            self.grad_storage.items[@intFromEnum(ref.idx)] = grad;
 
             var child_list = std.ArrayList(ValueRef).init(self.allocator);
             defer child_list.deinit();
@@ -204,12 +204,12 @@ pub fn ValueManager(Data: type) type {
             while (i < child_list.items.len) : (i += 1) {
                 const curr = child_list.items[i];
 
-                if (curr.op != .noop) {
+                if (curr.op != .noop or curr.op != .external) {
                     const curr_grad = self.getGrad(curr);
                     const children = self.children_storage.items[self.child_idx_map.get(curr.idx).?..];
 
                     switch (curr.op) {
-                        .noop => unreachable,
+                        .noop, .external => unreachable,
                         .add => {
                             self.grad_storage.items[@intFromEnum(children[0].idx)] += curr_grad;
                             self.grad_storage.items[@intFromEnum(children[1].idx)] += curr_grad;
@@ -232,7 +232,7 @@ pub fn ValueManager(Data: type) type {
                         },
                     }
                     const children_len: usize = switch (curr.op) {
-                        .noop => unreachable,
+                        .noop, .external => unreachable,
                         .exp, .neg => 1,
                         .add, .mul => 2,
                         _ => 1,
@@ -243,252 +243,181 @@ pub fn ValueManager(Data: type) type {
                 }
             }
         }
+        pub fn backward(self: *Self, ref: ValueRef) void {
+            self.backwardWithGrad(ref, one);
+        }
     };
 }
 
-const APPROX = 0.001;
-
-test "ValueManager Operations and Duplicate Terms Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
-
-    const a = vm.new(1);
-    const b = vm.new(2);
-    const c = vm.new(3);
-
-    // f = c * e
-    //   = c * ad
-    //   = ca(a + b)
-    // 9 = a^2c + abc [a := 1, b := 2, c := 3]
-    //f'a= 2ac + bc [a := 1, b := 2, c := 3]
-    const d = vm.add(a, b);
-    try std.testing.expectEqual(vm.getData(c), vm.getData(d));
-
-    const e = vm.mul(a, d);
-    try std.testing.expectEqual(vm.getData(c), vm.getData(e));
-
-    const f = vm.mul(c, e);
-    vm.backward(f);
-    try std.testing.expectApproxEqAbs(9, vm.getData(f), APPROX);
-
-    try std.testing.expectApproxEqAbs(1, vm.getGrad(f), APPROX);
-    try std.testing.expectApproxEqAbs(3, vm.getGrad(e), APPROX);
-    try std.testing.expectApproxEqAbs(3, vm.getGrad(c), APPROX);
-    try std.testing.expectApproxEqAbs(3, vm.getGrad(d), APPROX);
-    try std.testing.expectApproxEqAbs(3, vm.getGrad(b), APPROX);
-    try std.testing.expectApproxEqAbs(12, vm.getGrad(a), APPROX);
+pub const Orientation = enum(u1) { by_row, by_column };
+pub fn ManyRef(m: comptime_int, n: comptime_int, canonical: bool) type {
+    return struct {
+        val_ref: ValueRef,
+        // if oriented by row, we store m vectors of size n
+        // if oriented by column, we store n vectors of size m
+        // The canonical representation is that we store by what there is fewer of
+        comptime oriented: Orientation = @enumFromInt(~@as(u1, @bitCast(canonical)) ^ @intFromEnum(@as(Orientation, if (m > n) .by_column else if (m <= n) .by_row))),
+        comptime rows: usize = m,
+        comptime columns: usize = n,
+        inline fn numVectors(self: @This()) comptime_int {
+            return comptime switch (self.oriented) {
+                .by_row => self.rows,
+                .by_column => self.columns,
+            };
+        }
+        inline fn vectorSize(self: @This()) comptime_int {
+            return comptime switch (self.oriented) {
+                .by_row => self.columns,
+                .by_column => self.rows,
+            };
+        }
+    };
 }
-
-test "ValueManager Negation Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
-
-    const a = vm.new(1);
-    const b = vm.new(2);
-
-    const d = vm.neg(b);
-    const e = vm.add(a, d);
-    try std.testing.expectApproxEqAbs(-1, vm.getData(e), APPROX);
-
-    vm.backward(e);
-    try std.testing.expectApproxEqAbs(-1, vm.getGrad(b), APPROX);
+test "Ensure ManyRef Size" {
+    std.debug.assert(@sizeOf(ManyRef(0, 0, true)) == 4);
 }
+// Assume each value in vector_size is unique
+pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
+    switch (@typeInfo(Scalar)) {
+        .float => {},
+        else => @compileError("Scalar type must be float"),
+    }
+    comptime var vector_list: [vector_sizes.len]type = undefined;
+    inline for (0..vector_sizes.len) |i| {
+        vector_list[i] = @Vector(vector_sizes[i], Scalar);
+    }
 
-test "ValueManager Exponentiation Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
+    comptime var vm_list: [vector_sizes.len]type = undefined;
+    inline for (0..vector_sizes.len) |i| {
+        vm_list[i] = ValueManager(Scalar, vector_sizes[i]);
+    }
+    const Vms = std.meta.Tuple(&vm_list);
 
-    const a = vm.new(@log(2.0));
-    const b = vm.new(@log(2.0));
+    return struct {
+        allocator: std.mem.Allocator,
+        vms: Vms,
 
-    const c = vm.add(a, b);
-    try std.testing.expectApproxEqAbs(2 * @log(2.0), vm.getData(c), APPROX);
+        const Self = @This();
 
-    const d = vm.exp(c);
-    try std.testing.expectApproxEqAbs(4, vm.getData(d), APPROX);
+        // returns the idx for which vm this vector is in
+        fn validateVector(Vec: type) comptime_int {
+            inline for (vector_list, 0..) |Vector, i| {
+                if (Vec == Vector) {
+                    return i;
+                }
+            } else {
+                @compileError(std.fmt.comptimePrint("There is no ValueManager for vector {d}", .{Vec}));
+            }
+        }
+        fn refVmIdx(orientation: Orientation, rows: comptime_int, columns: comptime_int) comptime_int {
+            return for (vector_sizes, 0..) |size, i| {
+                if ((orientation == .by_row and columns == size) or (orientation == .by_column and rows == size)) {
+                    break i;
+                }
+            } else {
+                @compileError(std.fmt.comptimePrint("There is no ValueManager for ref with orientation {}, rows {} and columns {}", .{ orientation, rows, columns }));
+            };
+        }
 
-    vm.backward(d);
-    try std.testing.expectApproxEqAbs(4, vm.getGrad(a), APPROX);
-    try std.testing.expectApproxEqAbs(4, vm.getGrad(b), APPROX);
-    try std.testing.expectApproxEqAbs(4, vm.getGrad(c), APPROX);
-}
+        fn vectorSize(Vec: type) comptime_int {
+            switch (@typeInfo(Vec)) {
+                .vector => |v| {
+                    switch (@typeInfo(v.child)) {
+                        .float => |f| if (f.bits == @bitSizeOf(Scalar)) return v.len else @compileError("Float types must match"),
+                        else => @compileError(std.fmt.comptimePrint("{} is not a vector of floats", .{Vec})),
+                    }
+                },
+                else => @compileError(std.fmt.comptimePrint("{} is not a vector of floats", .{Vec})),
+            }
+        }
 
-test "ValueManager Power Raising Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
+        pub fn getData(self: *Self, ref: anytype) switch (ref.oriented) {
+            .by_row => [ref.rows]@Vector(ref.columns, Scalar),
+            .by_column => [ref.columns]@Vector(ref.rows, Scalar),
+        } {
+            const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
+            return self.vms[vm_idx].data_storage.items[@intFromEnum(ref.val_ref.idx)..][0..ref.numVectors()].*;
+        }
+        pub fn init(a: std.mem.Allocator, capacity: usize) !Self {
+            var vms: Vms = undefined;
+            inline for (&vms) |*vm| {
+                vm.* = try @TypeOf(vm.*).init(a, capacity);
+            }
+            return .{ .allocator = a, .vms = vms };
+        }
+        pub fn deinit(self: *Self) void {
+            inline for (&self.vms) |*vm| {
+                vm.deinit();
+            }
+        }
+        pub fn newRow(self: *Self, row: anytype) ManyRef(1, vectorSize(@TypeOf(row)), true) {
+            const vm_idx = Self.validateVector(@TypeOf(row));
 
-    const a = vm.new(2);
-    const b = vm.new(3);
+            return .{ .val_ref = self.vms[vm_idx].new(row), .oriented = .by_row };
+        }
+        pub fn manyNewRows(self: *Self, rows: anytype) ManyRef(rows.len, vectorSize(@TypeOf(rows[0])), true) {
+            inline for (rows[1..], rows[0 .. rows.len - 1]) |v1, v2| {
+                if (@TypeOf(v1) != @TypeOf(v2)) @compileError("Expected Array of Same typed vectors");
+            }
+            const vm_idx = self.validateVector(@TypeOf(rows[0]));
 
-    const c = vm.powi(a, 3);
-    try std.testing.expectApproxEqAbs(8, vm.getData(c), APPROX);
+            const ref = ValueRef{
+                .op = .noop,
+                .idx = @enumFromInt(self.data_storage.items.len),
+            };
 
-    const d = vm.powi(b, 2);
-    try std.testing.expectApproxEqAbs(9, vm.getData(d), APPROX);
+            self.vms[vm_idx].data_storage.appendSlice(self.allocator, &rows) catch |err| {
+                std.debug.panic("Failed to store data {any}: {}", .{ rows, err });
+            };
 
-    const e = vm.add(c, d);
-    try std.testing.expectApproxEqAbs(17, vm.getData(e), APPROX);
-    vm.backward(e);
+            return .{ .val_ref = ref, .oriented = .by_row };
+        }
+        pub fn newColumn(self: *Self, column: anytype) ManyRef(vectorSize(@TypeOf(column)), 1, true) {
+            const vm_idx = self.validateVector(@TypeOf(column));
 
-    try std.testing.expectApproxEqAbs(12, vm.getGrad(a), APPROX);
-    try std.testing.expectApproxEqAbs(6, vm.getGrad(b), APPROX);
-}
+            return .{ .val_ref = self.vms[vm_idx].new(column), .oriented = .by_column };
+        }
+        pub fn manyNewColumns(self: *Self, columns: anytype) ManyRef(vectorSize(@TypeOf(columns[0])), columns.len, true) {
+            inline for (columns[1..], columns[0 .. columns.len - 1]) |v1, v2| {
+                if (@TypeOf(v1) != @TypeOf(v2)) @compileError("Expected Array of Same typed vectors");
+            }
+            const vm_idx = validateVector(@TypeOf(columns[0]));
 
-test "ValueManager Division Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
+            const ref = ValueRef{
+                .op = .noop,
+                .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
+            };
 
-    const a = vm.new(2);
-    const b = vm.new(3);
+            self.vms[vm_idx].data_storage.appendSlice(self.allocator, &columns) catch |err| {
+                std.debug.panic("Failed to store data {any}: {}", .{ columns, err });
+            };
 
-    const c = vm.powi(a, -1);
-    try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
+            return .{ .val_ref = ref, .oriented = .by_column };
+        }
 
-    const d = vm.div(b, a);
-    try std.testing.expectApproxEqAbs(1.5, vm.getData(d), APPROX);
+        fn sameRefTypes(rows: comptime_int, columns: comptime_int, _: ManyRef(rows, columns, true), _: ManyRef(rows, columns, true)) void {}
+        pub fn add(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
+            sameRefTypes(ref1.rows, ref1.columns, ref1, ref2);
+            const vm_id1 = refVmIdx(ref1.oriented, ref1.rows, ref1.columns);
+            const vm_id2 = refVmIdx(ref2.oriented, ref2.rows, ref2.columns);
+            if (vm_id1 == vm_id2) {
+                const result = .{
+                    .val_ref = ValueRef{
+                        .op = .add,
+                        .idx = @enumFromInt(self.vms[vm_id1].data_storage.items.len),
+                    },
+                    .oriented = ref1.oriented,
+                };
 
-    const e = vm.mul(c, d);
-    try std.testing.expectApproxEqAbs(0.75, vm.getData(e), APPROX);
-    vm.backward(e);
+                for (0..ref1.numVectors()) |i| {
+                    _ = self.vms[vm_id1].add(.{ .op = ref1.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref1.val_ref.idx) + i) }, .{
+                        .op = ref2.val_ref.op,
+                        .idx = @enumFromInt(@intFromEnum(ref2.val_ref.idx) + i),
+                    });
+                }
 
-    try std.testing.expectApproxEqAbs(-0.75, vm.getGrad(a), APPROX);
-    try std.testing.expectApproxEqAbs(0.25, vm.getGrad(b), APPROX);
-}
-
-test "ValueManager Vector Test" {
-    var vm = try ValueManager(@Vector(4, f32)).init(std.testing.allocator, 10);
-    defer vm.deinit();
-
-    const a = vm.new([_]f32{ 1, 2, 3, 4 });
-    const b = vm.new(@splat(5));
-    const c = vm.new([_]f32{ 0.09, 2, 10, 1.1 });
-
-    const d = vm.powi(a, 2);
-    try std.testing.expectApproxEqAbs(1, vm.getData(d)[0], APPROX);
-    try std.testing.expectApproxEqAbs(4, vm.getData(d)[1], APPROX);
-    try std.testing.expectApproxEqAbs(9, vm.getData(d)[2], APPROX);
-    try std.testing.expectApproxEqAbs(16, vm.getData(d)[3], APPROX);
-
-    const e = vm.div(d, b);
-    try std.testing.expectApproxEqAbs(1.0 / 5.0, vm.getData(e)[0], APPROX);
-    try std.testing.expectApproxEqAbs(4.0 / 5.0, vm.getData(e)[1], APPROX);
-    try std.testing.expectApproxEqAbs(9.0 / 5.0, vm.getData(e)[2], APPROX);
-    try std.testing.expectApproxEqAbs(16.0 / 5.0, vm.getData(e)[3], APPROX);
-
-    const f = vm.add(e, c);
-    try std.testing.expectApproxEqAbs(1.0 / 5.0 + 0.09, vm.getData(f)[0], APPROX);
-    try std.testing.expectApproxEqAbs(4.0 / 5.0 + 2.0, vm.getData(f)[1], APPROX);
-    try std.testing.expectApproxEqAbs(9.0 / 5.0 + 10.0, vm.getData(f)[2], APPROX);
-    try std.testing.expectApproxEqAbs(16.0 / 5.0 + 1.1, vm.getData(f)[3], APPROX);
-
-    vm.backward(f);
-
-    try std.testing.expectEqual(@as(@Vector(4, f32), @splat(1)), vm.getGrad(c));
-
-    const a_over_b = vm.getData(a) / vm.getData(b);
-    const df_db = -a_over_b * a_over_b;
-
-    try std.testing.expectApproxEqAbs(df_db[0], vm.getGrad(b)[0], APPROX);
-    try std.testing.expectApproxEqAbs(df_db[1], vm.getGrad(b)[1], APPROX);
-    try std.testing.expectApproxEqAbs(df_db[2], vm.getGrad(b)[2], APPROX);
-    try std.testing.expectApproxEqAbs(df_db[3], vm.getGrad(b)[3], APPROX);
-
-    const df_da = a_over_b + a_over_b;
-
-    try std.testing.expectApproxEqAbs(df_da[0], vm.getGrad(a)[0], APPROX);
-    try std.testing.expectApproxEqAbs(df_da[1], vm.getGrad(a)[1], APPROX);
-    try std.testing.expectApproxEqAbs(df_da[2], vm.getGrad(a)[2], APPROX);
-    try std.testing.expectApproxEqAbs(df_da[3], vm.getGrad(a)[3], APPROX);
-}
-
-test "ValueManager Square Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
-
-    const a = vm.new(2);
-
-    const b = vm.powi(a, 2);
-    // try std.testing.expectApproxEqAbs(4, vm.getData(b), APPROX);
-    try std.testing.expectApproxEqAbs(4, vm.getData(b), APPROX);
-
-    vm.backward(b);
-
-    try std.testing.expectApproxEqAbs(4, vm.getGrad(a), APPROX);
-}
-
-test "ValueManager Power of Zero Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
-
-    const a = vm.new(2);
-
-    const b = vm.powi(a, 0);
-    // try std.testing.expectApproxEqAbs(4, vm.getData(b), APPROX);
-    try std.testing.expectApproxEqAbs(1, vm.getData(b), APPROX);
-
-    vm.backward(b);
-
-    try std.testing.expectApproxEqAbs(0, vm.getGrad(a), APPROX);
-}
-
-test "ValueManager Recalculate Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
-
-    const a = vm.new(2);
-    const b = vm.new(3);
-
-    const c = vm.powi(a, -1);
-    try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
-
-    const d = vm.div(b, a);
-    try std.testing.expectApproxEqAbs(1.5, vm.getData(d), APPROX);
-
-    const e = vm.mul(c, d);
-    try std.testing.expectApproxEqAbs(0.75, vm.getData(e), APPROX);
-
-    vm.recalculate(c);
-    vm.recalculate(d);
-    vm.recalculate(e);
-
-    try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
-    try std.testing.expectApproxEqAbs(1.5, vm.getData(d), APPROX);
-    try std.testing.expectApproxEqAbs(0.75, vm.getData(e), APPROX);
-
-    vm.backward(e);
-    try std.testing.expectApproxEqAbs(-0.75, vm.getGrad(a), APPROX);
-    try std.testing.expectApproxEqAbs(0.25, vm.getGrad(b), APPROX);
-}
-
-test "ValueManager forward Test" {
-    var vm = try ValueManager(f32).init(std.testing.allocator, 10);
-    defer vm.deinit();
-
-    const a = vm.new(2);
-    const b = vm.new(3);
-
-    const c = vm.powi(a, -1);
-    try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
-
-    const d = vm.div(b, a);
-    try std.testing.expectApproxEqAbs(1.5, vm.getData(d), APPROX);
-
-    const e = vm.mul(c, d);
-    try std.testing.expectApproxEqAbs(0.75, vm.getData(e), APPROX);
-
-    vm.backward(e);
-    try std.testing.expectApproxEqAbs(-0.75, vm.getGrad(a), APPROX);
-    try std.testing.expectApproxEqAbs(0.25, vm.getGrad(b), APPROX);
-
-    vm.getDataPtr(a).* = 1;
-    vm.zeroGrad();
-
-    vm.forward(e);
-    try std.testing.expectApproxEqAbs(1, vm.getData(c), APPROX);
-    try std.testing.expectApproxEqAbs(3, vm.getData(d), APPROX);
-    try std.testing.expectApproxEqAbs(3, vm.getData(e), APPROX);
-
-    vm.backward(e);
-    try std.testing.expectApproxEqAbs(-6, vm.getGrad(a), APPROX);
-    try std.testing.expectApproxEqAbs(1, vm.getGrad(b), APPROX);
+                return result;
+            } else unreachable;
+        }
+    };
 }
