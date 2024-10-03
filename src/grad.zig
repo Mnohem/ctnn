@@ -33,13 +33,14 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
 
     return struct {
         allocator: std.mem.Allocator,
-        // indexed by Idx Type
+        // data_storage and grad_storage indexed by Idx Type
         data_storage: std.ArrayListUnmanaged(Data),
         grad_storage: std.ArrayListUnmanaged(Data),
-        child_idx_map: std.AutoArrayHashMapUnmanaged(Idx, u32),
-        // indexed by u32 returned from child_idx_map
-        // children_storage could theoretically have a larger length than data/grad_storage since we store
-        // external ValueRefs as well
+        child_idx_map: std.AutoArrayHashMapUnmanaged(Idx, usize),
+        // children_storage indexed by the usize returned from child_idx_map
+        // children from one parent are stored together after the index so they may be taken as a slice
+        // children_storage stores ValueRefs for local operations, i32 for pow
+        // stores *ValueManager over two indices and other children for external operations
         children_storage: std.ArrayListUnmanaged(ValueRef),
 
         const Self = @This();
@@ -49,7 +50,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 .allocator = a,
                 .data_storage = try std.ArrayListUnmanaged(Data).initCapacity(a, capacity),
                 .grad_storage = std.ArrayListUnmanaged(Data){ .items = &[_]Data{}, .capacity = 0 },
-                .child_idx_map = try std.AutoArrayHashMapUnmanaged(Idx, u32).init(a, &[_]Idx{}, &[_]u32{}),
+                .child_idx_map = try std.AutoArrayHashMapUnmanaged(Idx, usize).init(a, &[_]Idx{}, &[_]usize{}),
                 .children_storage = try std.ArrayListUnmanaged(ValueRef).initCapacity(a, capacity),
             };
         }
@@ -86,7 +87,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
             }
             new_ref.op = op;
 
-            try self.child_idx_map.put(self.allocator, new_ref.idx, @intCast(self.children_storage.items.len));
+            try self.child_idx_map.put(self.allocator, new_ref.idx, self.children_storage.items.len);
             errdefer _ = self.child_idx_map.swapRemove(new_ref.idx);
             try self.children_storage.appendSlice(self.allocator, children);
 
@@ -338,6 +339,7 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
             return self.vms[vm_idx].data_storage.items[@intFromEnum(ref.val_ref.idx)..][0..ref.numVectors()].*;
         }
+
         pub fn init(a: std.mem.Allocator, capacity: usize) !Self {
             var vms: Vms = undefined;
             inline for (&vms) |*vm| {
@@ -351,19 +353,19 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             }
         }
         pub fn newRow(self: *Self, row: anytype) ManyRef(1, vectorSize(@TypeOf(row)), true) {
-            const vm_idx = Self.validateVector(@TypeOf(row));
+            const vm_idx = validateVector(@TypeOf(row));
 
             return .{ .val_ref = self.vms[vm_idx].new(row), .oriented = .by_row };
         }
-        pub fn manyNewRows(self: *Self, rows: anytype) ManyRef(rows.len, vectorSize(@TypeOf(rows[0])), true) {
+        pub fn manyNewRows(self: *Self, rows: anytype) ManyRef(rows.len, vectorSize(@TypeOf(rows[0])), rows.len < vectorSize(@TypeOf(rows[0]))) {
             inline for (rows[1..], rows[0 .. rows.len - 1]) |v1, v2| {
                 if (@TypeOf(v1) != @TypeOf(v2)) @compileError("Expected Array of Same typed vectors");
             }
-            const vm_idx = self.validateVector(@TypeOf(rows[0]));
+            const vm_idx = validateVector(@TypeOf(rows[0]));
 
             const ref = ValueRef{
                 .op = .noop,
-                .idx = @enumFromInt(self.data_storage.items.len),
+                .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
             };
 
             self.vms[vm_idx].data_storage.appendSlice(self.allocator, &rows) catch |err| {
@@ -373,11 +375,11 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             return .{ .val_ref = ref, .oriented = .by_row };
         }
         pub fn newColumn(self: *Self, column: anytype) ManyRef(vectorSize(@TypeOf(column)), 1, true) {
-            const vm_idx = self.validateVector(@TypeOf(column));
+            const vm_idx = validateVector(@TypeOf(column));
 
             return .{ .val_ref = self.vms[vm_idx].new(column), .oriented = .by_column };
         }
-        pub fn manyNewColumns(self: *Self, columns: anytype) ManyRef(vectorSize(@TypeOf(columns[0])), columns.len, true) {
+        pub fn manyNewColumns(self: *Self, columns: anytype) ManyRef(vectorSize(@TypeOf(columns[0])), columns.len, columns.len <= vectorSize(@TypeOf(columns[0]))) {
             inline for (columns[1..], columns[0 .. columns.len - 1]) |v1, v2| {
                 if (@TypeOf(v1) != @TypeOf(v2)) @compileError("Expected Array of Same typed vectors");
             }
@@ -395,11 +397,21 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             return .{ .val_ref = ref, .oriented = .by_column };
         }
 
-        fn sameRefTypes(rows: comptime_int, columns: comptime_int, _: ManyRef(rows, columns, true), _: ManyRef(rows, columns, true)) void {}
+        // User facing functions are type checked but must be canonical
+        // This can be ensured by the user using self.reorient
+        fn sameRefTypes(ref1: anytype, ref2: anytype) void {
+            if (ref1.rows != ref2.rows or ref1.columns != ref2.columns) {
+                @compileError(std.fmt.comptimePrint("{} and {} are not the same shape", .{ ref1, ref2 }));
+            } else if (ref1.oriented != ref2.oriented) {
+                @compileError(std.fmt.comptimePrint("{} and {} are not oriented the same way", .{ ref1, ref2 }));
+            }
+        }
+
         pub fn add(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
-            sameRefTypes(ref1.rows, ref1.columns, ref1, ref2);
+            sameRefTypes(ref1, ref2);
             const vm_id1 = refVmIdx(ref1.oriented, ref1.rows, ref1.columns);
             const vm_id2 = refVmIdx(ref2.oriented, ref2.rows, ref2.columns);
+
             if (vm_id1 == vm_id2) {
                 const result = .{
                     .val_ref = ValueRef{
@@ -418,6 +430,67 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
 
                 return result;
             } else unreachable;
+        }
+        pub fn elemMul(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
+            sameRefTypes(ref1, ref2);
+            const vm_id1 = refVmIdx(ref1.oriented, ref1.rows, ref1.columns);
+            const vm_id2 = refVmIdx(ref2.oriented, ref2.rows, ref2.columns);
+
+            if (vm_id1 == vm_id2) {
+                const result = .{
+                    .val_ref = ValueRef{
+                        .op = .add,
+                        .idx = @enumFromInt(self.vms[vm_id1].data_storage.items.len),
+                    },
+                    .oriented = ref1.oriented,
+                };
+
+                for (0..ref1.numVectors()) |i| {
+                    _ = self.vms[vm_id1].mul(.{ .op = ref1.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref1.val_ref.idx) + i) }, .{
+                        .op = ref2.val_ref.op,
+                        .idx = @enumFromInt(@intFromEnum(ref2.val_ref.idx) + i),
+                    });
+                }
+
+                return result;
+            } else unreachable;
+        }
+        pub fn sumRows(self: *Self, ref: anytype) ManyRef(ref.rows, 1, true) {
+            std.debug.assert(@TypeOf(ref) == ManyRef(ref.rows, ref.columns, true));
+
+            var vector: @Vector(ref.rows, Scalar) = undefined;
+            for (self.getData(ref)) |vec| {
+                for (0..ref.rows) |i| {
+                    vector[i] = @reduce(.Add, vec);
+                }
+            }
+            // const vm_idx = validateVector(@TypeOf(vector));
+            // const vm_ptr = &self.vms[vm_idx];
+
+            // TODO Need to store children for backward
+            // TODO Need to store external operator
+            //  for external ops, children are not only ValueRefs (probably change ValueManager to reflect this)
+            //  children_storage stores 32bit (or 64bit) blocks that can be reinterpreted
+            //  we can store pointers to other vms, external operators, sizes, and ValueRefs from other vms
+
+            return self.newColumn(vector);
+        }
+        pub fn sumColumns(self: *Self, ref: anytype) ManyRef(1, ref.columns, true) {
+            std.debug.assert(@TypeOf(ref) == ManyRef(ref.rows, ref.columns, true));
+
+            var vector: @Vector(ref.columns, Scalar) = undefined;
+            for (self.getData(ref)) |vec| {
+                for (0..ref.columns) |i| {
+                    vector[i] = @reduce(.Add, vec);
+                }
+            }
+            var result = self.newRow(vector);
+            result.val_ref.op = .external;
+
+            // TODO Need to store children for backward
+            // TODO Need to store external operator
+
+            return result;
         }
     };
 }

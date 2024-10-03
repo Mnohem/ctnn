@@ -301,3 +301,104 @@ test "ManyValueManager Addition" {
         }
     }
 }
+
+test "ManyValueManager Element Wise Multiplication" {
+    const SIZE = 4;
+    const V = @Vector(SIZE, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{SIZE}).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const a = mvm.newColumn(@as(V, @splat(3)));
+    for (0..SIZE) |i| {
+        try std.testing.expectApproxEqAbs(3, mvm.getData(a)[0][i], APPROX);
+    }
+    const b = mvm.newColumn(@as(V, @splat(1)));
+    for (0..SIZE) |i| {
+        try std.testing.expectApproxEqAbs(1, mvm.getData(b)[0][i], APPROX);
+    }
+
+    const c = mvm.elemMul(a, b);
+    for (0..SIZE) |i| {
+        try std.testing.expectApproxEqAbs(3, mvm.getData(c)[0][i], APPROX);
+    }
+
+    const rows = 3;
+    const columns = SIZE;
+    const x = mvm.manyNewRows([1]V{@as(V, .{ 1, 2, 3, 4 })} ** rows);
+    for (0..rows) |row| {
+        for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(column)) + 1, mvm.getData(x)[row][column], APPROX);
+        }
+    }
+    const y = mvm.manyNewRows([1]V{@as(V, .{ 4, 3, 2, 1 })} ** rows);
+    for (0..rows) |row| {
+        for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(4 - @as(f32, @floatFromInt(column)), mvm.getData(y)[row][column], APPROX);
+        }
+    }
+
+    const z = mvm.elemMul(x, y);
+    for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == 0 or column == 3) 4 else 6, mvm.getData(z)[row][column], APPROX);
+        }
+    }
+}
+test "ManyValueManager Addition and Multiplication" {
+    const SIZE = 2;
+    const V = @Vector(SIZE, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{SIZE}).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const a = mvm.newColumn(@as(V, @splat(3)));
+    const b = mvm.newColumn(@as(V, @splat(1)));
+    const c = mvm.newColumn(@as(V, @splat(2)));
+
+    const d = mvm.add(a, b);
+    for (0..SIZE) |i| {
+        try std.testing.expectApproxEqAbs(4, mvm.getData(d)[0][i], APPROX);
+    }
+    const e = mvm.elemMul(d, c);
+    for (0..SIZE) |i| {
+        try std.testing.expectApproxEqAbs(8, mvm.getData(e)[0][i], APPROX);
+    }
+
+    const rows = 3;
+    const columns = SIZE;
+    const x = mvm.manyNewRows([1]V{@as(V, .{ 1, 2 })} ** rows);
+    const y = mvm.manyNewRows([1]V{@as(V, .{ 1, 2 })} ** rows);
+    const u = mvm.manyNewRows([1]V{@as(V, .{ 2, 0 })} ** rows);
+
+    const w = mvm.elemMul(x, y);
+    for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == 0) 1 else 4, mvm.getData(w)[row][column], APPROX);
+        }
+    }
+    const z = mvm.add(u, w);
+    for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == 0) 3 else 4, mvm.getData(z)[row][column], APPROX);
+        }
+    }
+}
+
+test "ManyValueManager Sum Rows and Columns" {
+    const V4 = @Vector(4, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{ 3, 4 }).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const rows = 3;
+    const x = mvm.manyNewRows([1]V4{@as(V4, .{ 1, 2, 3, 4 })} ** rows);
+    const y = mvm.sumRows(x);
+    for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(10, mvm.getData(y)[0][row], APPROX);
+    }
+
+    const columns = 3;
+    const w = mvm.manyNewColumns([1]V4{@as(V4, .{ 2, 2, 2, 2 })} ** columns);
+    const z = mvm.sumColumns(w);
+    for (0..columns) |column| {
+        try std.testing.expectApproxEqAbs(8, mvm.getData(z)[0][column], APPROX);
+    }
+}
