@@ -41,7 +41,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         // children from one parent are stored together after the index so they may be taken as a slice
         // children_storage stores ValueRefs for local operations, i32 for pow
         // stores *ValueManager over two indices and other children for external operations
-        children_storage: std.ArrayListUnmanaged(ValueRef),
+        children_storage: std.ArrayListUnmanaged(u32),
 
         const Self = @This();
 
@@ -51,7 +51,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 .data_storage = try std.ArrayListUnmanaged(Data).initCapacity(a, capacity),
                 .grad_storage = std.ArrayListUnmanaged(Data){ .items = &[_]Data{}, .capacity = 0 },
                 .child_idx_map = try std.AutoArrayHashMapUnmanaged(Idx, usize).init(a, &[_]Idx{}, &[_]usize{}),
-                .children_storage = try std.ArrayListUnmanaged(ValueRef).initCapacity(a, capacity),
+                .children_storage = try std.ArrayListUnmanaged(u32).initCapacity(a, capacity),
             };
         }
         pub fn deinit(self: *Self) void {
@@ -80,7 +80,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         pub fn getGrad(self: *const Self, ref: ValueRef) Data {
             return self.grad_storage.items[@intFromEnum(ref.idx)];
         }
-        fn newExpr(self: *Self, op: Operator, data: Data, children: []const ValueRef) !ValueRef {
+        fn newExpr(self: *Self, op: Operator, data: Data, children: []const u32) !ValueRef {
             var new_ref = self.new(data);
             errdefer {
                 _ = self.data_storage.pop();
@@ -95,12 +95,12 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         }
 
         pub fn add(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
-            return self.newExpr(.add, self.getData(id1) + self.getData(id2), &[_]ValueRef{ id1, id2 }) catch |err| {
+            return self.newExpr(.add, self.getData(id1) + self.getData(id2), &[_]u32{ @bitCast(id1), @bitCast(id2) }) catch |err| {
                 std.debug.panic("Failed to add refs {} and {}: {}", .{ id1, id2, err });
             };
         }
         pub fn mul(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
-            return self.newExpr(.mul, self.getData(id1) * self.getData(id2), &[_]ValueRef{ id1, id2 }) catch |err| {
+            return self.newExpr(.mul, self.getData(id1) * self.getData(id2), &[_]u32{ @bitCast(id1), @bitCast(id2) }) catch |err| {
                 std.debug.panic("Failed to multiply refs {} and {}: {}", .{ id1, id2, err });
             };
         }
@@ -118,17 +118,17 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 result *= data;
             }
             result = if (std.math.sign(num) == -1) one / result else result;
-            return self.newExpr(@enumFromInt(@as(i8, num) << op_without_int_size), result, &[_]ValueRef{ref}) catch |err| {
+            return self.newExpr(@enumFromInt(@as(i8, num) << op_without_int_size), result, &[_]u32{@bitCast(ref)}) catch |err| {
                 std.debug.panic("Failed to raise ref {} to the power of {d}: {}", .{ ref, num, err });
             };
         }
         pub fn exp(self: *Self, ref: ValueRef) ValueRef {
-            return self.newExpr(.exp, @exp(self.getData(ref)), &[_]ValueRef{ref}) catch |err| {
+            return self.newExpr(.exp, @exp(self.getData(ref)), &[_]u32{@bitCast(ref)}) catch |err| {
                 std.debug.panic("Failed to exponentiate ref {}: {}", .{ ref, err });
             };
         }
         pub fn neg(self: *Self, ref: ValueRef) ValueRef {
-            return self.newExpr(.neg, -self.getData(ref), &[_]ValueRef{ref}) catch |err| {
+            return self.newExpr(.neg, -self.getData(ref), &[_]u32{@bitCast(ref)}) catch |err| {
                 std.debug.panic("Failed to negate ref {}: {}", .{ ref, err });
             };
         }
@@ -151,24 +151,24 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
             switch (ref.op) {
                 .noop, .external => unreachable,
                 .add, .mul => {
-                    self.recalculate(c[0]);
-                    self.recalculate(c[1]);
+                    self.recalculate(@bitCast(c[0]));
+                    self.recalculate(@bitCast(c[1]));
                 },
-                _ => self.recalculate(c[0]),
-                .exp, .neg => self.recalculate(c[0]),
+                _ => self.recalculate(@bitCast(c[0])),
+                .exp, .neg => self.recalculate(@bitCast(c[0])),
             }
 
             const data: *Data = &self.data_storage.items[@intFromEnum(ref.idx)];
 
             data.* = switch (ref.op) {
                 .noop, .external => unreachable,
-                .add => self.getData(c[0]) + self.getData(c[1]),
-                .mul => self.getData(c[0]) * self.getData(c[1]),
-                .exp => @exp(self.getData(c[0])),
-                .neg => -self.getData(c[0]),
+                .add => self.getData(@bitCast(c[0])) + self.getData(@bitCast(c[1])),
+                .mul => self.getData(@bitCast(c[0])) * self.getData(@bitCast(c[1])),
+                .exp => @exp(self.getData(@bitCast(c[0]))),
+                .neg => -self.getData(@bitCast(c[0])),
                 _ => blk: {
                     const num = @as(PowInt, @intCast(@intFromEnum(ref.op) >> op_without_int_size));
-                    const d = self.getData(c[0]);
+                    const d = self.getData(@bitCast(c[0]));
                     var result: Data = one;
                     for (0..@abs(num)) |_| {
                         result *= d;
@@ -212,33 +212,34 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                     switch (curr.op) {
                         .noop, .external => unreachable,
                         .add => {
-                            self.grad_storage.items[@intFromEnum(children[0].idx)] += curr_grad;
-                            self.grad_storage.items[@intFromEnum(children[1].idx)] += curr_grad;
+                            self.grad_storage.items[@intFromEnum(@as(ValueRef, @bitCast(children[0])).idx)] += curr_grad;
+                            self.grad_storage.items[@intFromEnum(@as(ValueRef, @bitCast(children[1])).idx)] += curr_grad;
                         },
                         .mul => {
-                            self.grad_storage.items[@intFromEnum(children[0].idx)] += self.getData(children[1]) * curr_grad;
-                            self.grad_storage.items[@intFromEnum(children[1].idx)] += self.getData(children[0]) * curr_grad;
+                            self.grad_storage.items[@intFromEnum(@as(ValueRef, @bitCast(children[0])).idx)] += self.getData(@bitCast(children[1])) * curr_grad;
+                            self.grad_storage.items[@intFromEnum(@as(ValueRef, @bitCast(children[1])).idx)] += self.getData(@bitCast(children[0])) * curr_grad;
                         },
                         .exp => {
-                            self.grad_storage.items[@intFromEnum(children[0].idx)] += self.getData(curr) * curr_grad;
+                            self.grad_storage.items[@intFromEnum(@as(ValueRef, @bitCast(children[0])).idx)] += self.getData(curr) * curr_grad;
                         },
                         .neg => {
-                            self.grad_storage.items[@intFromEnum(children[0].idx)] -= curr_grad;
+                            self.grad_storage.items[@intFromEnum(@as(ValueRef, @bitCast(children[0])).idx)] -= curr_grad;
                         },
                         //.pow
                         _ => {
                             const num = @as(PowInt, @intCast(@intFromEnum(curr.op) >> op_without_int_size));
                             const data_num: Data = if (data_is_scalar) @floatFromInt(num) else @splat(@floatFromInt(num));
-                            self.grad_storage.items[@intFromEnum(children[0].idx)] += data_num * (self.getData(curr) / self.getData(children[0])) * curr_grad;
+                            self.grad_storage.items[@intFromEnum(@as(ValueRef, @bitCast(children[0])).idx)] +=
+                                data_num * (self.getData(curr) / self.getData(@bitCast(children[0]))) * curr_grad;
                         },
                     }
                     const children_len: usize = switch (curr.op) {
-                        .noop, .external => unreachable,
+                        .noop, .external => continue,
                         .exp, .neg => 1,
                         .add, .mul => 2,
                         _ => 1,
                     };
-                    child_list.appendSlice(children[0..children_len]) catch |err| {
+                    child_list.appendSlice(@ptrCast(children[0..children_len])) catch |err| {
                         std.debug.panic("Failed to calculate backward for {} at {}: {}", .{ ref, curr, err });
                     };
                 }
