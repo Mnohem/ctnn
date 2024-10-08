@@ -1,5 +1,5 @@
 const std = @import("std");
-const ManyValueManager = @import("grad.zig").ManyValueManager;
+const ManyValueManager = @import("manygrad.zig").ManyValueManager;
 const ValueManager = @import("grad.zig").ValueManager;
 
 const APPROX = 0.001;
@@ -215,7 +215,7 @@ test "ValueManager Recalculate Test" {
     const e = vm.mul(c, d);
     try std.testing.expectApproxEqAbs(0.75, vm.getData(e), APPROX);
 
-    vm.forward(e);
+    try vm.forward(e);
 
     try std.testing.expectApproxEqAbs(0.5, vm.getData(c), APPROX);
     try std.testing.expectApproxEqAbs(1.5, vm.getData(d), APPROX);
@@ -249,7 +249,7 @@ test "ValueManager Forward Test" {
     vm.getDataPtr(a).* = 1;
     vm.zeroGrad();
 
-    vm.forward(e);
+    try vm.forward(e);
     try std.testing.expectApproxEqAbs(1, vm.getData(c), APPROX);
     try std.testing.expectApproxEqAbs(3, vm.getData(d), APPROX);
     try std.testing.expectApproxEqAbs(3, vm.getData(e), APPROX);
@@ -400,5 +400,101 @@ test "ManyValueManager Sum Rows and Columns" {
     const z = mvm.sumColumns(w);
     for (0..columns) |column| {
         try std.testing.expectApproxEqAbs(8, mvm.getData(z)[0][column], APPROX);
+    }
+}
+
+test "ManyValueManager Sum Rows and Columns Recalculate" {
+    const V4 = @Vector(4, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{ 3, 4 }).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const rows = 3;
+    const x = mvm.manyNewRows([1]V4{@as(V4, .{ 1, 2, 3, 4 })} ** rows);
+    const y = mvm.sumRows(x);
+    for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(10, mvm.getData(y)[0][row], APPROX);
+    }
+
+    const columns = 3;
+    const w = mvm.manyNewColumns([1]V4{@as(V4, .{ 2, 2, 2, 2 })} ** columns);
+    const z = mvm.sumColumns(w);
+    for (0..columns) |column| {
+        try std.testing.expectApproxEqAbs(8, mvm.getData(z)[0][column], APPROX);
+    }
+
+    mvm.getDataPtr(w)[0][0] = -2;
+    mvm.getDataPtr(w)[1][1] = -2;
+    mvm.getDataPtr(w)[2][2] = -2;
+    try mvm.forward(z);
+
+    for (0..columns) |column| {
+        try std.testing.expectApproxEqAbs(4, mvm.getData(z)[0][column], APPROX);
+    }
+}
+
+test "ManyValueManager Forward Test" {
+    const V4 = @Vector(4, f32);
+    const V3 = @Vector(3, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{ 3, 4 }).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const rows = 3;
+    const columns = 4;
+    const a = mvm.manyNewRows([1]V4{@as(V4, .{ 0, 0, 1, 1 })} ** rows);
+    const x = mvm.manyNewRows([1]V4{@as(V4, .{ 1, 2, 3, 4 })} ** rows);
+    const b = mvm.elemMul(a, x);
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == 0 or column == 1) 0 else if (column == 2) 3 else 4, mvm.getData(b)[row][column], APPROX);
+        }
+    }
+    const y = mvm.sumRows(b);
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(7, mvm.getData(y)[0][row], APPROX);
+    }
+    const w = mvm.newColumn(V3{ 1, 2, 3 });
+    const end = mvm.add(y, w);
+
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(8 + row, mvm.getData(end)[0][row], APPROX);
+    }
+
+    const vm3 = mvm.vms[0];
+    const needs_forward = vm3.requestExternalForwards(end.val_ref);
+    defer mvm.allocator.free(needs_forward);
+    try std.testing.expectEqual(1, needs_forward.len);
+    try std.testing.expectEqual(y.val_ref, needs_forward[0]);
+
+    try mvm.forward(end);
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == 0 or column == 1) 0 else if (column == 2) 3 else 4, mvm.getData(b)[row][column], APPROX);
+        }
+    }
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(7, mvm.getData(y)[0][row], APPROX);
+    }
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(8 + row, mvm.getData(end)[0][row], APPROX);
+    }
+
+    mvm.getDataPtr(a).* = [3]V4{ V4{ 1, 0, 0, 0 }, V4{ 0, 1, 0, 0 }, V4{ 0, 0, 1, 0 } };
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == row) 1 else 0, mvm.getData(a)[row][column], APPROX);
+        }
+    }
+
+    try mvm.forward(end);
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == row) 1 + column else 0, mvm.getData(b)[row][column], APPROX);
+        }
+    }
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(1 + row, mvm.getData(y)[0][row], APPROX);
+    }
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(2 * (1 + row), mvm.getData(end)[0][row], APPROX);
     }
 }
