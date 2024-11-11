@@ -1,9 +1,16 @@
 const std = @import("std");
-const ManyValueManager = @import("manygrad.zig").ManyValueManager;
-const ValueManager = @import("grad.zig").ValueManager;
+const grad = @import("grad.zig");
+const manygrad = @import("manygrad.zig");
+const ManyValueManager = manygrad.ManyValueManager;
+const ValueManager = grad.ValueManager;
 
 const APPROX = 0.001;
 
+test "Vector Collection Size" {
+    try std.testing.expectEqual(16, @sizeOf(@Vector(4, f32)));
+    try std.testing.expectEqual(32, @sizeOf([2]@Vector(4, f32)));
+    try std.testing.expectEqual(64, @sizeOf([4]@Vector(4, f32)));
+}
 test "ValueManager Operations and Duplicate Terms Test" {
     var vm = try ValueManager(f32, 0).init(std.testing.allocator, 10);
     defer vm.deinit();
@@ -613,6 +620,58 @@ test "ManyValueManager Operations Test" {
             try std.testing.expectApproxEqAbs(1, mvm.getGrad(lambda)[row][column], APPROX);
             try std.testing.expectApproxEqAbs(-mvm.getData(c)[row][column] * mvm.getData(y)[row][column], mvm.getGrad(a)[row][column], APPROX);
             try std.testing.expectApproxEqAbs(2 * mvm.getData(x)[row][column] * mvm.getData(c)[row][column], mvm.getGrad(x)[row][column], APPROX);
+        }
+    }
+}
+
+test "ManyValueManager Splat Test" {
+    const V4 = @Vector(4, f32);
+    const V3 = @Vector(3, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{ 2, 3, 4 }).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const b = mvm.newColumn(V3{ 1, 2, 3 });
+    const c = mvm.splatIntoRows(4, b);
+    try std.testing.expectEqual(manygrad.ManyRef(3, 4, .by_row), @TypeOf(c));
+
+    const x = mvm.manyNewRows([1]V4{@splat(2)} ** 3);
+    const y = mvm.elemMul(c, x);
+    const z = mvm.sumRows(y);
+    try std.testing.expectEqual(manygrad.ManyRef(3, 1, .by_column), @TypeOf(z));
+    try std.testing.expectEqual(manygrad.ManyRef(1, 3, .by_row), @TypeOf(z.transpose()));
+    const end = mvm.splatIntoColumns(2, z.transpose());
+    try std.testing.expectEqual(manygrad.ManyRef(2, 3, .by_column), @TypeOf(end));
+    const rows = 2;
+    const columns = 3;
+
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(8 * (column + 1), mvm.getData(end)[column][row], APPROX);
+        }
+    }
+
+    try mvm.backward(end);
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(16, mvm.getGrad(b)[0][row], APPROX);
+    }
+
+    mvm.getDataPtr(b).* = [1]V3{@splat(4)};
+
+    try mvm.forward(end);
+
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(32, mvm.getData(end)[column][row], APPROX);
+        }
+    }
+
+    mvm.getDataPtr(b).* = [1]V3{V3{ 4, 3, 2 }};
+
+    try mvm.forward(end);
+
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs((4 - column) * 8, mvm.getData(end)[column][row], APPROX);
         }
     }
 }

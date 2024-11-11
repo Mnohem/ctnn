@@ -3,7 +3,7 @@ const std = @import("std");
 // power operator is hidden in the unused (_) bits of the Operator enum
 // unused bits are interpreted as a signed int to be raised to
 // .external means this value came from an operation in ManyValueManager
-pub const Operator = enum(i8) { noop = 1, add, mul, exp, neg, external_sum, _ };
+pub const Operator = enum(i8) { noop = 1, add, mul, exp, neg, external_sum, external_max, external_splat, _ };
 pub const Idx = enum(u24) { _ };
 // Index is crammed with Operator, meaning our index is 24 bit
 // Thus we can only store 16,777,215 values
@@ -15,7 +15,7 @@ pub const ValueRef = packed struct {
 const LOWEST_POWER_SIZE = 4;
 pub const op_without_int_size: comptime_int = @ceil(@log2(@as(comptime_float, @floatFromInt(std.meta.fields(Operator).len))));
 const size_for_int = 8 - op_without_int_size;
-const _ = if (size_for_int < LOWEST_POWER_SIZE) @compileError(std.fmt.comptimePrint("Operator enum is too large to store int: {d} bits left", .{size_for_int}));
+const _ = if (size_for_int < LOWEST_POWER_SIZE) @compileError(std.fmt.comptimePrint("Operator enum is too large to store power int: {d} bits left", .{size_for_int}));
 pub const PowInt = std.meta.Int(.signed, size_for_int);
 // Require caller to give a one_value for easy interop with Vectors
 pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
@@ -41,7 +41,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         // children_storage indexed by the usize returned from child_idx_map
         // children from one parent are stored together after the index so they may be taken as a slice
         // children_storage stores ValueRefs for local operations, i32 for pow
-        // stores *ValueManager over two indices and other children for external operations
+        // stores tuple index of this vm in the mvm and other children for external operations
         children_storage: std.ArrayListUnmanaged(u32),
         expr_lists: std.AutoArrayHashMapUnmanaged(ValueRef, []ValueRef),
 
@@ -83,7 +83,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         pub fn getData(self: *const Self, ref: ValueRef) Data {
             return self.data_storage.items[@intFromEnum(ref.idx)];
         }
-        // Calling this function is only valid after using backward
+        // Calling this function is only correct after using backward
         pub fn getGrad(self: *const Self, ref: ValueRef) Data {
             return self.grad_storage.items[@intFromEnum(ref.idx)];
         }
@@ -151,16 +151,16 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
             @memset(self.grad_storage.items, std.mem.zeroes(Data));
         }
 
+        // returns the parts of this expression that originate from external operations
         // returns slice that must be freed by caller
         pub fn externalParts(self: *const Self, ref: ValueRef) []ValueRef {
-            if (ref.op == .noop) return &[0]ValueRef{};
             var externals = std.ArrayList(ValueRef).init(self.allocator);
             var to_travel = std.ArrayList(ValueRef).init(self.allocator);
             defer to_travel.deinit();
-            var curr_ref = ref;
 
+            var curr_ref = ref;
             op: switch (curr_ref.op) {
-                .external_sum => {
+                .external_sum, .external_max, .external_splat => {
                     externals.append(curr_ref) catch unreachable;
                     continue :op .noop;
                 },
@@ -186,29 +186,32 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
 
         pub fn getLocalChildren(self: *Self, ref: ValueRef) []ValueRef {
             const num_children: usize = switch (ref.op) {
-                .noop, .external_sum => @panic(".noop and .external_sum have no entry in child_idx_map"),
+                .noop, .external_sum, .external_splat, .external_max => @panic(".noop and external operators have no local children"),
                 .add, .mul => 2,
                 _ => 1,
                 .exp, .neg => 1,
             };
             return @ptrCast(self.children_storage.items[self.child_idx_map.get(ref.idx).?..][0..num_children]);
         }
-        pub fn getExternalInfo(self: *const Self, ref: ValueRef) struct { u32, ValueRef } {
+        pub fn getExternalInfo(self: *const Self, ref: ValueRef) struct { u32, ValueRef, []u32 } {
             switch (ref.op) {
-                .external_sum => {
+                .external_sum, .external_max, .external_splat => {
                     const children_slice = self.children_storage.items[self.child_idx_map.get(ref.idx).?..];
-                    return .{ children_slice[0], @bitCast(children_slice[1]) };
+                    return .{ children_slice[0], @bitCast(children_slice[1]), children_slice[2..] };
                 },
-                else => @panic(".external_sum only external implemented"),
+                else => @panic("Only external operators have external info"),
             }
         }
         pub fn recalculateData(self: *Self, ref: ValueRef) void {
-            std.debug.assert(ref.op != .noop and ref.op != .external_sum);
+            std.debug.assert(switch (ref.op) {
+                .noop, .external_sum, .external_max, .external_splat => false,
+                else => true,
+            });
             const c = self.getLocalChildren(ref);
             const data = self.getDataPtr(ref);
 
             data.* = switch (ref.op) {
-                .noop, .external_sum => unreachable,
+                .noop, .external_sum, .external_splat, .external_max => unreachable,
                 .add => self.getData(c[0]) + self.getData(c[1]),
                 .mul => self.getData(c[0]) * self.getData(c[1]),
                 .exp => @exp(self.getData(c[0])),
@@ -225,10 +228,12 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
             };
         }
 
-        // Need to call this before calling forward or backward
-        // Needs ability to hold multiple expressions
+        // TODO ability to hold multiple expressions
         pub fn createExprList(self: *Self, ref: ValueRef) !void {
-            std.debug.assert(ref.op != .noop and ref.op != .external_sum);
+            std.debug.assert(switch (ref.op) {
+                .noop, .external_sum, .external_max, .external_splat => false,
+                else => true,
+            });
             std.debug.assert(self.expr_lists.get(ref) == null);
 
             var expr_list = std.ArrayList(ValueRef).init(self.allocator);
@@ -237,7 +242,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
             var i: isize = 0;
             while (i < expr_list.items.len) : (i += 1) {
                 switch (expr_list.items[@intCast(i)].op) {
-                    .noop, .external_sum => {
+                    .noop, .external_sum, .external_max, .external_splat => {
                         _ = expr_list.orderedRemove(@intCast(i));
                         i -= 1;
                     },
@@ -249,7 +254,10 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         }
 
         pub fn forward(self: *Self, ref: ValueRef) !void {
-            if (ref.op == .noop or ref.op == .external_sum) return;
+            switch (ref.op) {
+                .noop, .external_sum, .external_max, .external_splat => return,
+                else => {},
+            }
 
             const expr_list = if (self.expr_lists.get(ref)) |expr_list| expr_list else blk: {
                 try self.createExprList(ref);
@@ -262,12 +270,15 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         }
 
         pub fn recalculateGrad(self: *Self, ref: ValueRef) void {
-            std.debug.assert(ref.op != .noop and ref.op != .external_sum);
+            std.debug.assert(switch (ref.op) {
+                .noop, .external_sum, .external_max, .external_splat => false,
+                else => true,
+            });
             const c = self.getLocalChildren(ref);
             const curr_grad = self.getGrad(ref);
 
             switch (ref.op) {
-                .noop, .external_sum => unreachable,
+                .noop, .external_sum, .external_max, .external_splat => unreachable,
                 .add => {
                     self.grad_storage.items[@intFromEnum(c[0].idx)] += curr_grad;
                     self.grad_storage.items[@intFromEnum(c[1].idx)] += curr_grad;
@@ -287,7 +298,10 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         }
 
         pub fn backwardWithGrad(self: *Self, ref: ValueRef, grad: ?Data) !void {
-            if (ref.op == .noop or ref.op == .external_sum) return;
+            switch (ref.op) {
+                .noop, .external_sum, .external_max, .external_splat => return,
+                else => {},
+            }
 
             if (self.grad_storage.items.len != self.data_storage.items.len) {
                 self.grad_storage.resize(self.allocator, self.data_storage.items.len) catch |err| {
