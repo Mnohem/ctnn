@@ -427,7 +427,7 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             const parent_vm_idx = validateVector(@TypeOf(vector));
             const child_vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
             const val_ref = self.vms[parent_vm_idx].newExpr(.external_sum, vector, &([_]u32{ child_vm_idx, @bitCast(ref.val_ref) })) catch |err| {
-                std.debug.panic("Could not sum columns from {}: {}", .{ ref, err });
+                std.debug.panic("Could not sum rows from {}: {}", .{ ref, err });
             };
 
             return .{ .val_ref = val_ref, .oriented = .by_column };
@@ -441,9 +441,38 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             }
             const parent_vm_idx = validateVector(@TypeOf(vector));
             const child_vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
-            // children stored: tuple index to vm of children, ValueRef to start of columns
             const val_ref = self.vms[parent_vm_idx].newExpr(.external_sum, vector, &([_]u32{ child_vm_idx, @bitCast(ref.val_ref) })) catch |err| {
                 std.debug.panic("Could not sum columns from {}: {}", .{ ref, err });
+            };
+
+            return .{ .val_ref = val_ref, .oriented = .by_row };
+        }
+        pub fn maxRows(self: *Self, ref: anytype) ManyRef(ref.rows, 1, .by_column) {
+            std.debug.assert(@TypeOf(ref) == ManyRef(ref.rows, ref.columns, .by_row));
+
+            var vector: @Vector(ref.rows, Scalar) = undefined;
+            for (self.getData(ref), 0..ref.rows) |vec, i| {
+                vector[i] = @reduce(.Max, vec);
+            }
+            const parent_vm_idx = validateVector(@TypeOf(vector));
+            const child_vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
+            const val_ref = self.vms[parent_vm_idx].newExpr(.external_max, vector, &([_]u32{ child_vm_idx, @bitCast(ref.val_ref) })) catch |err| {
+                std.debug.panic("Could not max rows from {}: {}", .{ ref, err });
+            };
+
+            return .{ .val_ref = val_ref, .oriented = .by_column };
+        }
+        pub fn maxColumns(self: *Self, ref: anytype) ManyRef(1, ref.columns, .by_row) {
+            std.debug.assert(@TypeOf(ref) == ManyRef(ref.rows, ref.columns, .by_column));
+
+            var vector: @Vector(ref.columns, Scalar) = undefined;
+            for (self.getData(ref), 0..ref.columns) |vec, i| {
+                vector[i] = @reduce(.Max, vec);
+            }
+            const parent_vm_idx = validateVector(@TypeOf(vector));
+            const child_vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
+            const val_ref = self.vms[parent_vm_idx].newExpr(.external_max, vector, &([_]u32{ child_vm_idx, @bitCast(ref.val_ref) })) catch |err| {
+                std.debug.panic("Could not max columns from {}: {}", .{ ref, err });
             };
 
             return .{ .val_ref = val_ref, .oriented = .by_row };
@@ -457,18 +486,14 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                 if (cvm_idx == child_vm_idx) {
                     switch (ref.val_ref.op) {
                         .external_sum => {
-                            var vector: @Vector(vector_sizes[vmi], Scalar) = undefined;
                             for (cvm.data_storage.items[@intFromEnum(child.idx)..][0..@TypeOf(ref).vectorSize()], 0..) |vec, i| {
-                                vector[i] = @reduce(.Add, vec);
+                                self.vms[vmi].getDataPtr(ref.val_ref)[i] = @reduce(.Add, vec);
                             }
-                            self.vms[vmi].getDataPtr(ref.val_ref).* = vector;
                         },
                         .external_max => {
-                            var vector: @Vector(vector_sizes[vmi], Scalar) = undefined;
                             for (cvm.data_storage.items[@intFromEnum(child.idx)..][0..@TypeOf(ref).vectorSize()], 0..) |vec, i| {
-                                vector[i] = @reduce(.Max, vec);
+                                self.vms[vmi].getDataPtr(ref.val_ref)[i] = @reduce(.Max, vec);
                             }
-                            self.vms[vmi].getDataPtr(ref.val_ref).* = vector;
                         },
                         .external_splat => {
                             const vector = cvm.data_storage.items[@intFromEnum(child.idx)];
@@ -568,8 +593,7 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                 self.vms[vmi].zeroGrad();
             }
             for (0..@TypeOf(ref).numVectors()) |i| {
-                const val_ref: ValueRef = .{ .op = ref.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref.val_ref.idx) + i) };
-                self.vms[vmi].grad_storage.items[@intFromEnum(val_ref.idx)] = @splat(1);
+                self.vms[vmi].grad_storage.items[@intFromEnum(ref.val_ref.idx)..][i] = @splat(1);
             }
 
             const start = if (self.expr_graph.getIndex(.{ vmi, ref.val_ref })) |idx| idx else blk: {
@@ -585,7 +609,6 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
 
                         for (vm_local_externals) |external| {
                             const child_vm_idx, const child, const extra = vm.getExternalInfo(external);
-                            const vector = vm.getGrad(external);
 
                             inline for (&self.vms, 0..) |*cvm, cvm_idx| {
                                 if (cvm_idx == child_vm_idx) {
@@ -596,16 +619,23 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                                         cvm.zeroGrad();
                                     }
 
+                                    const curr_grad = vm.getGrad(external);
                                     switch (external.op) {
                                         .external_sum => for (cvm.grad_storage.items[@intFromEnum(child.idx)..][0..vector_sizes[vm_idx]], 0..) |*g, i| {
-                                            g.* += @splat(vector[i]);
+                                            g.* += @splat(curr_grad[i]);
+                                        },
+                                        .external_max => for (cvm.grad_storage.items[@intFromEnum(child.idx)..][0..vector_sizes[vm_idx]], cvm.data_storage.items[@intFromEnum(child.idx)..][0..vector_sizes[vm_idx]], 0..) |*g, d, i| {
+                                            // This is not mathematical as max is a discrete function
+                                            // Right now it is the naive solution, the max num is directly proportional, other nums have no effect (deriv of 0)
+                                            // If there are multiple equal max nums, we could balance the proportion between them, but we don't
+                                            const curr_max = vm.getDataPtr(external)[i];
+                                            const which_max = d == @as(@TypeOf(d), @splat(curr_max));
+                                            const unbalanced = @select(Scalar, which_max, @as(@TypeOf(d), @splat(curr_grad[i])), @as(@TypeOf(d), @splat(0)));
+                                            g.* += unbalanced; // / @as(@TypeOf(unbalanced), @splat(@reduce(.Add, unbalanced)));
                                         },
                                         .external_splat => {
                                             const child_grad_ptr = &cvm.grad_storage.items[@intFromEnum(child.idx)];
-                                            child_grad_ptr[extra[0]] += @reduce(.Add, vm.getGrad(external));
-                                        },
-                                        .external_max => for (cvm.grad_storage.items[@intFromEnum(child.idx)..][0..vector_sizes[vm_idx]]) |_| {
-                                            // g.* += @splat(vector[i]);
+                                            child_grad_ptr[extra[0]] += @reduce(.Add, curr_grad);
                                         },
                                         else => unreachable,
                                     }

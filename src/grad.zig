@@ -6,7 +6,7 @@ const std = @import("std");
 pub const Operator = enum(i8) { noop = 1, add, mul, exp, neg, external_sum, external_max, external_splat, _ };
 pub const Idx = enum(u24) { _ };
 // Index is crammed with Operator, meaning our index is 24 bit
-// Thus we can only store 16,777,215 values
+// Thus we can only store 16,777,215 vectors
 pub const ValueRef = packed struct {
     op: Operator,
     idx: Idx,

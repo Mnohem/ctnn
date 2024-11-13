@@ -675,3 +675,46 @@ test "ManyValueManager Splat Test" {
         }
     }
 }
+
+test "ManyValueManager Max Rows and Columns" {
+    const V4 = @Vector(4, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{ 3, 4 }).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const rows = 3;
+    const columns = 4;
+    const x = mvm.manyNewRows([1]V4{V4{ 1, 2, 3, 4 }} ** rows);
+    const y = mvm.maxRows(x);
+    for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(4, mvm.getData(y)[0][row], APPROX);
+    }
+    for (0..rows) |row| {
+        mvm.getDataPtr(x)[row][3] = 0;
+    }
+    try mvm.forward(y);
+    for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(3, mvm.getData(y)[0][row], APPROX);
+    }
+    try mvm.backward(y);
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == 2) 1 else 0, mvm.getGrad(x)[row][column], APPROX);
+        }
+    }
+    mvm.zeroGrad();
+
+    const w = mvm.splatIntoColumns(4, y.transpose());
+    const z = mvm.maxColumns(w);
+    for (0..rows) |row| {
+        for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(3, mvm.getData(w)[row][column], APPROX);
+        }
+    }
+
+    try mvm.backward(z);
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expectApproxEqAbs(if (column == 2) 4 else 0, mvm.getGrad(x)[row][column], APPROX);
+        }
+    }
+}
