@@ -3,7 +3,7 @@ const std = @import("std");
 // power operator is hidden in the unused (_) bits of the Operator enum
 // unused bits are interpreted as a signed int to be raised to
 // .external means this value came from an operation in ManyValueManager
-pub const Operator = enum(i8) { noop = 1, add, mul, exp, neg, external_sum, external_max, external_splat, _ };
+pub const Operator = enum(i8) { noop = 1, add, mul, max, exp, neg, external_sum, external_max, external_splat, _ };
 pub const Idx = enum(u24) { _ };
 // Index is crammed with Operator, meaning our index is 24 bit
 // Thus we can only store 16,777,215 vectors
@@ -111,6 +111,11 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 std.debug.panic("Failed to multiply refs {} and {}: {}", .{ id1, id2, err });
             };
         }
+        pub fn max(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
+            return self.newExpr(.add, @max(self.getData(id1), self.getData(id2)), &[_]u32{ @bitCast(id1), @bitCast(id2) }) catch |err| {
+                std.debug.panic("Failed to add refs {} and {}: {}", .{ id1, id2, err });
+            };
+        }
         pub fn div(self: *Self, id1: ValueRef, id2: ValueRef) ValueRef {
             return self.mul(id1, self.powi(id2, -1));
         }
@@ -143,10 +148,6 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
             return self.add(id1, self.neg(id2));
         }
 
-        pub fn eval(self: *Self, comptime expr: []const u8, variables: anytype) !@import("eval.zig").VarRefs(@TypeOf(variables), ValueRef) {
-            return @import("eval.zig").parse(Data, self, expr, variables);
-        }
-
         pub fn zeroGrad(self: *Self) void {
             @memset(self.grad_storage.items, std.mem.zeroes(Data));
         }
@@ -169,7 +170,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                     continue :op curr_ref.op;
                 } else return externals.toOwnedSlice() catch unreachable,
 
-                .add, .mul => {
+                .add, .mul, .max => {
                     const c = self.children_storage.items[self.child_idx_map.get(curr_ref.idx).?..];
                     to_travel.append(@bitCast(c[1])) catch unreachable;
                     curr_ref = @bitCast(c[0]);
@@ -187,7 +188,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         pub fn getLocalChildren(self: *Self, ref: ValueRef) []ValueRef {
             const num_children: usize = switch (ref.op) {
                 .noop, .external_sum, .external_splat, .external_max => @panic(".noop and external operators have no local children"),
-                .add, .mul => 2,
+                .add, .mul, .max => 2,
                 _ => 1,
                 .exp, .neg => 1,
             };
@@ -214,6 +215,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 .noop, .external_sum, .external_splat, .external_max => unreachable,
                 .add => self.getData(c[0]) + self.getData(c[1]),
                 .mul => self.getData(c[0]) * self.getData(c[1]),
+                .max => @max(self.getData(c[0]), self.getData(c[1])),
                 .exp => @exp(self.getData(c[0])),
                 .neg => -self.getData(c[0]),
                 _ => blk: {
@@ -286,6 +288,16 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 .mul => {
                     self.grad_storage.items[@intFromEnum(c[0].idx)] += self.getData(c[1]) * curr_grad;
                     self.grad_storage.items[@intFromEnum(c[1].idx)] += self.getData(c[0]) * curr_grad;
+                },
+                .max => {
+                    const selected0 = self.getData(c[0]) == self.getData(ref);
+                    if (data_is_scalar) {
+                        self.grad_storage.items[@intFromEnum(c[0].idx)] += if (selected0) curr_grad else 0;
+                        self.grad_storage.items[@intFromEnum(c[1].idx)] += if (!selected0) curr_grad else 0;
+                    } else {
+                        self.grad_storage.items[@intFromEnum(c[0].idx)] += @select(Scalar, selected0, curr_grad, @as(Data, @splat(0)));
+                        self.grad_storage.items[@intFromEnum(c[1].idx)] += @select(Scalar, selected0, @as(Data, @splat(0)), curr_grad);
+                    }
                 },
                 .exp => self.grad_storage.items[@intFromEnum(c[0].idx)] += self.getData(ref) * curr_grad,
                 .neg => self.grad_storage.items[@intFromEnum(c[0].idx)] -= curr_grad,

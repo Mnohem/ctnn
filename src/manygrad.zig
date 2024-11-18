@@ -135,6 +135,22 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             }
             self.expr_graph.deinit();
         }
+        pub fn valuesWithShapeOf(self: *Self, Shape: type, value: Scalar) Shape {
+            var ref: Shape = .{
+                .val_ref = ValueRef{
+                    .op = .noop,
+                    .idx = @enumFromInt(0),
+                },
+            };
+            const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
+            ref.val_ref.idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len);
+
+            self.vms[vm_idx].data_storage.appendSlice(self.allocator, &[1]@Vector(@TypeOf(ref).vectorSize(), Scalar){@splat(value)} ** @TypeOf(ref).numVectors()) catch |err| {
+                std.debug.panic("Failed to store value {} with shape of {any}: {}", .{ value, ref, err });
+            };
+
+            return ref;
+        }
         pub fn newRow(self: *Self, row: anytype) ManyRef(1, vectorSize(@TypeOf(row)), .by_row) {
             const vm_idx = validateVector(@TypeOf(row));
 
@@ -256,53 +272,72 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
         }
         pub fn add(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
             sameRefTypes(ref1, ref2);
-            const vm_id1 = refVmIdx(ref1.oriented, ref1.rows, ref1.columns);
-            const vm_id2 = refVmIdx(ref2.oriented, ref2.rows, ref2.columns);
+            const vm_idx = refVmIdx(ref1.oriented, ref1.rows, ref1.columns);
 
-            if (vm_id1 == vm_id2) {
-                const result = .{
-                    .val_ref = ValueRef{
-                        .op = .add,
-                        .idx = @enumFromInt(self.vms[vm_id1].data_storage.items.len),
-                    },
-                    .oriented = ref1.oriented,
-                };
+            const result: @TypeOf(ref1) = .{
+                .val_ref = ValueRef{
+                    .op = .add,
+                    .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
+                },
+                .oriented = ref1.oriented,
+            };
 
-                for (0..@TypeOf(ref1).numVectors()) |i| {
-                    _ = self.vms[vm_id1].add(.{ .op = ref1.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref1.val_ref.idx) + i) }, .{
-                        .op = ref2.val_ref.op,
-                        .idx = @enumFromInt(@intFromEnum(ref2.val_ref.idx) + i),
-                    });
-                }
+            for (0..@TypeOf(ref1).numVectors()) |i| {
+                _ = self.vms[vm_idx].add(.{ .op = ref1.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref1.val_ref.idx) + i) }, .{
+                    .op = ref2.val_ref.op,
+                    .idx = @enumFromInt(@intFromEnum(ref2.val_ref.idx) + i),
+                });
+            }
 
-                return result;
-            } else unreachable;
+            return result;
         }
         pub fn elemMul(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
             sameRefTypes(ref1, ref2);
-            const vm_id1 = refVmIdx(ref1.oriented, ref1.rows, ref1.columns);
-            const vm_id2 = refVmIdx(ref2.oriented, ref2.rows, ref2.columns);
+            const vm_idx = refVmIdx(ref1.oriented, ref1.rows, ref1.columns);
 
-            if (vm_id1 == vm_id2) {
-                const result = .{
-                    .val_ref = ValueRef{
-                        .op = .mul,
-                        .idx = @enumFromInt(self.vms[vm_id1].data_storage.items.len),
-                    },
-                    .oriented = ref1.oriented,
-                };
+            const result: @TypeOf(ref1) = .{
+                .val_ref = ValueRef{
+                    .op = .mul,
+                    .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
+                },
+                .oriented = ref1.oriented,
+            };
 
-                for (0..@TypeOf(ref1).numVectors()) |i| {
-                    _ = self.vms[vm_id1].mul(.{ .op = ref1.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref1.val_ref.idx) + i) }, .{
-                        .op = ref2.val_ref.op,
-                        .idx = @enumFromInt(@intFromEnum(ref2.val_ref.idx) + i),
-                    });
-                }
+            for (0..@TypeOf(ref1).numVectors()) |i| {
+                _ = self.vms[vm_idx].mul(.{ .op = ref1.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref1.val_ref.idx) + i) }, .{
+                    .op = ref2.val_ref.op,
+                    .idx = @enumFromInt(@intFromEnum(ref2.val_ref.idx) + i),
+                });
+            }
 
-                return result;
-            } else unreachable;
+            return result;
+        }
+        pub fn elemMax(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
+            sameRefTypes(ref1, ref2);
+            const vm_idx = refVmIdx(ref1.oriented, ref1.rows, ref1.columns);
+
+            const result: @TypeOf(ref1) = .{
+                .val_ref = ValueRef{
+                    .op = .max,
+                    .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
+                },
+                .oriented = ref1.oriented,
+            };
+
+            for (0..@TypeOf(ref1).numVectors()) |i| {
+                _ = self.vms[vm_idx].max(.{ .op = ref1.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref1.val_ref.idx) + i) }, .{
+                    .op = ref2.val_ref.op,
+                    .idx = @enumFromInt(@intFromEnum(ref2.val_ref.idx) + i),
+                });
+            }
+
+            return result;
         }
 
+        pub fn sub(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
+            sameRefTypes(ref1, ref2);
+            return self.add(ref1, self.neg(ref2));
+        }
         pub fn elemDiv(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
             sameRefTypes(ref1, ref2);
             return self.elemMul(ref1, self.elemPowi(ref2, -1));
@@ -311,7 +346,7 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
         pub fn elemPowi(self: *Self, ref: anytype, power: PowInt) @TypeOf(ref) {
             const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
 
-            const result = .{
+            const result: @TypeOf(ref) = .{
                 .val_ref = ValueRef{
                     .op = @enumFromInt(@as(i8, power) << op_without_int_size),
                     .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
@@ -328,7 +363,7 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
         pub fn elemExp(self: *Self, ref: anytype) @TypeOf(ref) {
             const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
 
-            const result = .{
+            const result: @TypeOf(ref) = .{
                 .val_ref = ValueRef{
                     .op = .exp,
                     .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
@@ -346,7 +381,7 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
         pub fn neg(self: *Self, ref: anytype) @TypeOf(ref) {
             const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
 
-            const result = .{
+            const result: @TypeOf(ref) = .{
                 .val_ref = ValueRef{
                     .op = .neg,
                     .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),

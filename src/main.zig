@@ -1,33 +1,36 @@
 const std = @import("std");
 const nn = @import("nn.zig");
 const mnist = @import("idx.zig");
+const manygrad = @import("manygrad.zig");
 
 const F = f32;
 
 const MNIST_IMAGE_SIZE = 28 * 28;
 
+const Mvm = manygrad.ManyValueManager(F, &.{ MNIST_IMAGE_SIZE, 32, 10, 1 });
+
 const LayerTypes = [_]type{
-    nn.SimpleLayer(MNIST_IMAGE_SIZE, 32, F, nn.sigmoid),
-    nn.SimpleLayer(32, 10, F, nn.softmax),
+    nn.SimpleLayer(Mvm, F, MNIST_IMAGE_SIZE, 32, nn.sigmoid),
+    nn.SimpleLayer(Mvm, F, 32, 10, nn.softmax),
 };
 
-const Model = nn.Model(&LayerTypes);
+const Model = nn.Model(10, &LayerTypes);
 
-const InputVector = LayerTypes[0].Input;
-const OutputVector = LayerTypes[LayerTypes.len - 1].Output;
+const InputVector = @Vector(LayerTypes[0].in_size, F);
+const OutputVector = @Vector(LayerTypes[LayerTypes.len - 1].out_size, F);
 
 pub fn test_run() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var alc = arena.allocator();
+    var allocator = arena.allocator();
 
     const train_image_size, const train_image_data = comptime mnist.openIdxFile("training/train-images-idx3-ubyte");
     _, const train_labels = comptime mnist.openIdxFile("training/train-labels-idx1-ubyte");
 
     const training_size: usize = @intCast(train_image_size);
 
-    var inputs = try alc.alloc(InputVector, training_size);
-    var expecteds = try alc.alloc(OutputVector, training_size);
+    var inputs = try allocator.alloc(InputVector, training_size);
+    var expecteds = try allocator.alloc(OutputVector, training_size);
 
     for (0..training_size) |i| {
         const offset = MNIST_IMAGE_SIZE * i;
@@ -43,20 +46,23 @@ pub fn test_run() !void {
     var prng = std.Random.DefaultPrng.init(@truncate(seed));
     const rng = prng.random();
 
-    var model = Model.init(rng);
+    var model = Model.init(allocator, rng);
 
     const steps = 1000;
     const learn_rate = 0.1;
     const batch_size = 10;
 
+    const loss = model.loss(batch_size);
+    const input0 = model.mvm.newColumn(inputs[0]);
+
     std.debug.print("-- Running Gradient Descent for {d} batches of size {d}\n\n", .{ steps, batch_size });
     for (0..steps) |i| {
-        model.batchGradDescent(rng, batch_size, inputs, expecteds, learn_rate);
+        model.batchGradDescent(rng, loss, batch_size, inputs, expecteds, learn_rate);
         if (i % 100 == 0) {
             std.debug.print("Iteration {}\n", .{i});
-            std.debug.print("-- Output 0 is {}\n", .{model.calculateOutputs(&inputs[0])});
+            std.debug.print("-- Output 0 is {}\n", .{model.mvm.getData(model.calculateOutputs(input0))[0]});
             std.debug.print("-- Expected 0 is {}\n", .{expecteds[0]});
-            std.debug.print("-- Model loss is {}\n", .{model.loss(inputs, expecteds)});
+            std.debug.print("-- Model loss is {}\n", .{model.mvm.getData(loss)[0]});
         }
     }
     std.debug.print("-- Finished {} steps of Gradient Descent\n", .{steps});
@@ -66,8 +72,8 @@ pub fn test_run() !void {
 
     const testing_size: usize = @intCast(test_image_size);
 
-    var test_inputs = try alc.alloc(InputVector, testing_size);
-    var test_expecteds = try alc.alloc(OutputVector, testing_size);
+    var test_inputs = try allocator.alloc(InputVector, testing_size);
+    var test_expecteds = try allocator.alloc(OutputVector, testing_size);
 
     for (0..testing_size) |i| {
         const offset = MNIST_IMAGE_SIZE * i;
@@ -75,20 +81,22 @@ pub fn test_run() !void {
             test_inputs[i][j] = @as(F, @floatFromInt(pixel)) / 255;
         }
 
+        // one hot encoding
         test_expecteds[i] = @splat(0);
         test_expecteds[i][@as(usize, test_labels[i])] = 1;
     }
 
     var correct: usize = 0;
     for (0..testing_size) |i| {
-        const output = model.calculateOutputs(&test_inputs[i]);
+        const input = model.mvm.newColumn(&test_inputs[i]);
+        const output = model.mvm.getData(model.calculateOutputs(input))[0];
 
         const is_correct = @reduce(.And, @round(output) == test_expecteds[i]);
 
         correct += @intFromBool(is_correct);
 
         if (i % 100 == 0) {
-            std.debug.print("Accuracy: {:.2}%\n", .{100 * @as(f32, @floatFromInt(correct)) / @as(f32, @floatFromInt(testing_size))});
+            std.debug.print("First {d} Accuracy: {:.2}%\n", .{ i, 100 * @as(f32, @floatFromInt(correct)) / @as(f32, @floatFromInt(testing_size)) });
         }
     }
 }

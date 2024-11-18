@@ -718,3 +718,36 @@ test "ManyValueManager Max Rows and Columns" {
         }
     }
 }
+
+test "ManyValueManager Max Operation" {
+    const V4 = @Vector(4, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{4}).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const columns = 4;
+    const x = mvm.newRow(V4{ 1, 2, 3, 4 });
+    const y = mvm.newRow(V4{ 4, 3, 2, 1 });
+    const z = mvm.elemMax(x, y);
+    try mvm.backward(z);
+    inline for (0..columns) |column| {
+        try std.testing.expectApproxEqAbs(if (column == 1 or column == 2) 3 else 4, mvm.getData(z)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(if (column == 2 or column == 3) 1 else 0, mvm.getGrad(x)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(if (column == 0 or column == 1) 1 else 0, mvm.getGrad(y)[0][column], APPROX);
+    }
+}
+
+test "MVM values with shape of" {
+    const V4 = @Vector(4, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{4}).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const rows = 3;
+    const columns = 4;
+    const x = mvm.manyNewRows([1]V4{V4{ 1, 2, 3, 4 }} ** rows);
+    const y = mvm.valuesWithShapeOf(@TypeOf(x), 1.0);
+    inline for (0..rows) |row| {
+        inline for (0..columns) |column| {
+            try std.testing.expect(if (column == 0) mvm.getData(x)[row][column] == mvm.getData(y)[row][column] else mvm.getData(x)[row][column] != mvm.getData(y)[row][column]);
+        }
+    }
+}
