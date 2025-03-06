@@ -7,7 +7,7 @@ pub fn SimpleLayer(
     comptime NType: type, // type of numbers to use
     comptime input_size: usize,
     comptime output_size: usize,
-    comptime activation: *const fn (type, type, Mvm, ManyRef(output_size, 1, .by_column)) ManyRef(output_size, 1, .by_column),
+    comptime activation: *const fn (type, type, *Mvm, ManyRef(output_size, 1, .by_column)) ManyRef(output_size, 1, .by_column),
 ) type {
     const InputRef = ManyRef(input_size, 1, .by_column);
     const OutputRef = ManyRef(output_size, 1, .by_column);
@@ -42,7 +42,7 @@ pub fn SimpleLayer(
 
             return .{
                 .weights = mvm.manyNewRows(weights),
-                .biases = mvm.newColumn(@splat(0.0)),
+                .biases = mvm.newColumn(@as(@Vector(out_size, NumType), @splat(0.0))),
             };
         }
 
@@ -63,34 +63,31 @@ pub fn Model(comptime max_batch_size: usize, comptime LayerTypes: []const type) 
     const Input = LayerTypes[0].Input;
     const Output = LayerTypes[END].Output;
 
-    comptime var unique_sizes = [1]comptime_int{0} ** LayerTypes.len ++ [1]comptime_int{0};
+    comptime var unique_sizes = [1]comptime_int{0} ** (LayerTypes.len + 1);
     unique_sizes[0] = LayerTypes[0].in_size;
     comptime var num_unique_sizes: usize = 1;
 
     inline for (LayerTypes[0..END], LayerTypes[1..], 0..) |PrevLayerTy, LayerTy, idx| {
         if (PrevLayerTy.Output != LayerTy.Input) @compileError(std.fmt.comptimePrint("Layers {d} and {d} do not agree in size", .{ idx, idx + 1 }));
-        const unique = for (unique_sizes[0..num_unique_sizes], 0..) |size, i| {
-            if (size != LayerTy.in_size) {
-                break i;
-            }
-        } else 0;
-        if (unique != 0) {
-            unique_sizes[unique] = LayerTy.in_size;
+
+        const unique = for (unique_sizes[0..num_unique_sizes]) |size| {
+            if (size == LayerTy.in_size) break false;
+        } else true;
+        if (unique) {
+            unique_sizes[num_unique_sizes] = LayerTy.in_size;
             num_unique_sizes += 1;
         }
     }
 
-    const unique = for (unique_sizes[0..num_unique_sizes], 0..) |size, i| {
-        if (size != LayerTypes[END].out_size) {
-            break i;
-        }
-    } else 0;
-    if (unique != 0) {
-        unique_sizes[unique] = LayerTypes[END].out_size;
+    const unique = for (unique_sizes[0..num_unique_sizes]) |size| {
+        if (size == LayerTypes[END].out_size) break false;
+    } else true;
+    if (unique) {
+        unique_sizes[num_unique_sizes] = LayerTypes[END].out_size;
         num_unique_sizes += 1;
     }
 
-    const uniques = unique_sizes[0..num_unique_sizes].*;
+    const uniques = unique_sizes[0..num_unique_sizes].* ++ [1]comptime_int{1};
     const Mvm = manygrad.ManyValueManager(LayerTypes[0].NumType, &uniques);
 
     return struct {
@@ -103,7 +100,7 @@ pub fn Model(comptime max_batch_size: usize, comptime LayerTypes: []const type) 
 
         pub fn init(allocator: std.mem.Allocator, rand: std.Random) Self {
             var layers: std.meta.Tuple(LayerTypes) = undefined;
-            var mvm = Mvm.init(allocator, 1);
+            var mvm = Mvm.init(allocator, 1) catch unreachable;
 
             inline for (0..LayerTypes.len) |idx| {
                 layers[idx] = LayerTypes[idx].init(&mvm, rand);
@@ -128,24 +125,24 @@ pub fn Model(comptime max_batch_size: usize, comptime LayerTypes: []const type) 
             return .{ .val_ref = .{ .op = .noop, .idx = @enumFromInt(idx + reserve_start) } };
         }
 
-        inline fn recCalculateLayer(self: *const Self, comptime layer_idx: usize, input: Input) LayerTypes[layer_idx].Output {
+        inline fn recCalculateLayer(self: *Self, comptime layer_idx: usize, input: Input) LayerTypes[layer_idx].Output {
             return if (layer_idx == 0)
                 self.layers[0].calculateOutputs(&self.mvm, input)
             else
                 self.layers[layer_idx].calculateOutputs(&self.mvm, self.recCalculateLayer(layer_idx - 1, input));
         }
 
-        pub fn calculateOutputs(self: *const Self, input: Input) Output {
+        pub fn calculateOutputs(self: *Self, input: Input) Output {
             return self.recCalculateLayer(END, input);
         }
 
-        pub fn singleLoss(self: *const Self, input: Input, expected: Output) Output {
+        pub fn singleLoss(self: *Self, input: Input, expected: Output) Output {
             const output = self.calculateOutputs(input);
 
             return cost(Mvm, Output, &self.mvm, output, expected);
         }
 
-        pub fn loss(self: *const Self, batch_size: usize) Output {
+        pub fn loss(self: *Self, batch_size: usize) Output {
             var total_loss = self.singleLoss(inputReserveIdxtoRef(0), expectedReserveIdxtoRef(0));
             for (1..batch_size) |i| {
                 const sing_loss = self.singleLoss(inputReserveIdxtoRef(@intCast(i)), expectedReserveIdxtoRef(@intCast(i)));
@@ -165,7 +162,7 @@ pub fn Model(comptime max_batch_size: usize, comptime LayerTypes: []const type) 
             try self.mvm.forward(loss_expr);
             try self.mvm.backward(loss_expr);
             inline for (&self.layers) |*layer| {
-                layer.applyGradients(learn_rate);
+                layer.applyGradients(&self.mvm, learn_rate);
             }
             self.mvm.zeroGrad();
         }
@@ -197,7 +194,7 @@ pub fn relu(Mvm: type, Ref: type, mvm: Mvm, ref: Ref) Ref {
 }
 pub fn softmax(Mvm: type, Ref: type, mvm: Mvm, ref: Ref) Ref {
     const norm_x = mvm.sub(ref, mvm.splatIntoColumns(ref.rows, mvm.maxColumns(ref)));
-    const ex = mvm.exp(norm_x);
+    const ex = mvm.elemExp(norm_x);
     const sum_ex = mvm.sumColumns(ex);
     return mvm.elemDiv(ex, mvm.splatIntoColumns(ref.rows, sum_ex));
 }

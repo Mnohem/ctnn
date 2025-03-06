@@ -57,7 +57,7 @@ pub fn test_run() !void {
 
     std.debug.print("-- Running Gradient Descent for {d} batches of size {d}\n\n", .{ steps, batch_size });
     for (0..steps) |i| {
-        model.batchGradDescent(rng, loss, batch_size, inputs, expecteds, learn_rate);
+        try model.batchGradDescent(rng, loss, batch_size, inputs, expecteds, learn_rate);
         if (i % 100 == 0) {
             std.debug.print("Iteration {}\n", .{i});
             std.debug.print("-- Output 0 is {}\n", .{model.mvm.getData(model.calculateOutputs(input0))[0]});
@@ -88,7 +88,7 @@ pub fn test_run() !void {
 
     var correct: usize = 0;
     for (0..testing_size) |i| {
-        const input = model.mvm.newColumn(&test_inputs[i]);
+        const input = model.mvm.newColumn(test_inputs[i]);
         const output = model.mvm.getData(model.calculateOutputs(input))[0];
 
         const is_correct = @reduce(.And, @round(output) == test_expecteds[i]);
@@ -102,16 +102,7 @@ pub fn test_run() !void {
 }
 
 pub fn main() !void {
-    // Expand stack size, we run out by default
-    // We might need to use libc for cross compat later
-    // std.posix.setrlimit(.STACK, .{
-    //     .cur = 0x0000000020000000,
-    //     .max = 0x0000000020000000,
-    // }) catch |err| {
-    //     std.debug.panic("Could not set stack size: {}", .{err});
-    // };
-
-    @setFloatMode(.optimized);
+    // @setFloatMode(.optimized);
 
     return test_run();
 }

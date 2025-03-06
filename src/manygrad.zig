@@ -565,32 +565,27 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                 const index = self.expr_graph.count();
                 for (self.expr_graph.keys()[prev_index..index], self.expr_graph.values()[prev_index..index]) |head_info, vm_local_externals| {
                     const head_vm_idx, _ = head_info;
-                    for (vm_local_externals) |requested| {
-                        inline for (&self.vms, 0..) |*vm, vm_idx| {
-                            if (vm_idx == head_vm_idx) {
-                                const child_vm_idx, const child, _ = vm.getExternalInfo(requested);
+                    std.debug.print("right before looping over vm_local_externals\n", .{});
+                    // compiler bug happens when iterating over tuple
+                    // vm_idx == head_vm_idx will evaluate to true when vm_idx = 1 and head_vm_idx = 3
+                    // does not occur in tests, only in debug builds of the nn
+                    // attempt to isolate and file bug report later
+                    for (vm_local_externals) |requested| inline for (&self.vms, 0..) |*vm, vm_idx| if (vm_idx == head_vm_idx) {
+                        const child_vm_idx, const child, _ = vm.getExternalInfo(requested);
 
-                                inline for (&self.vms, 0..) |*cvm, cvm_idx| {
-                                    if (cvm_idx == child_vm_idx) {
-                                        switch (requested.op) {
-                                            .external_sum, .external_max => for (0..vector_sizes[vm_idx]) |i| {
-                                                const child_val_ref: ValueRef = .{ .op = child.op, .idx = @enumFromInt(@intFromEnum(child.idx) + i) };
-                                                try self.expr_graph.putNoClobber(.{ child_vm_idx, child_val_ref }, cvm.externalParts(child_val_ref));
-                                            },
-                                            .external_splat => {
-                                                if (!self.expr_graph.contains(.{ child_vm_idx, child })) {
-                                                    try self.expr_graph.putNoClobber(.{ child_vm_idx, child }, cvm.externalParts(child));
-                                                }
-                                            },
-                                            else => unreachable,
-                                        }
-                                        break;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
+                        inline for (&self.vms, 0..) |*cvm, cvm_idx| if (cvm_idx == child_vm_idx) switch (requested.op) {
+                            .external_sum, .external_max => for (0..vector_sizes[vm_idx]) |i| {
+                                const child_val_ref: ValueRef = .{ .op = child.op, .idx = @enumFromInt(@intFromEnum(child.idx) + i) };
+                                const entry = try self.expr_graph.getOrPut(.{ child_vm_idx, child_val_ref });
+                                if (!entry.found_existing) entry.value_ptr.* = cvm.externalParts(child_val_ref);
+                            },
+                            .external_splat => {
+                                const entry = try self.expr_graph.getOrPut(.{ child_vm_idx, child });
+                                if (!entry.found_existing) entry.value_ptr.* = cvm.externalParts(child);
+                            },
+                            else => unreachable,
+                        };
+                    };
                 }
                 prev_index = index;
             }

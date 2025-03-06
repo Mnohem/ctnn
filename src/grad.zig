@@ -165,7 +165,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                     externals.append(curr_ref) catch unreachable;
                     continue :op .noop;
                 },
-                .noop => if (to_travel.popOrNull()) |r| {
+                .noop => if (to_travel.pop()) |r| {
                     curr_ref = r;
                     continue :op curr_ref.op;
                 } else return externals.toOwnedSlice() catch unreachable,
