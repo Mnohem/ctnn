@@ -1,9 +1,11 @@
 const std = @import("std");
 
+const mode = @import("builtin").mode;
+
 // power operator is hidden in the unused (_) bits of the Operator enum
 // unused bits are interpreted as a signed int to be raised to
 // .external means this value came from an operation in ManyValueManager
-pub const Operator = enum(i8) { noop = 1, add, mul, max, exp, neg, external_sum, external_max, external_splat, _ };
+pub const Operator = enum(i8) { noop = 1, add, mul, max, exp, neg, log, sqrt, external_sum, external_max, external_splat, _ };
 pub const Idx = enum(u24) { _ };
 // Index is crammed with Operator, meaning our index is 24 bit
 // Thus we can only store 16,777,215 vectors
@@ -12,6 +14,7 @@ pub const ValueRef = packed struct {
     idx: Idx,
 };
 
+// The lowest amount of bits Im willing to give to the power operation
 const LOWEST_POWER_SIZE = 4;
 pub const op_without_int_size: comptime_int = @ceil(@log2(@as(comptime_float, @floatFromInt(std.meta.fields(Operator).len))));
 const size_for_int = 8 - op_without_int_size;
@@ -26,9 +29,6 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
     const data_is_scalar = vector_size == 0;
     const Data = if (data_is_scalar) Scalar else @Vector(vector_size, Scalar);
     const one: Data = if (data_is_scalar) 1 else @splat(1);
-    // const one_half: Data = one / (one + one);
-
-    // The lowest amount of bits Im willing to give to the power operation
 
     comptime std.debug.assert(@sizeOf(ValueRef) == 4);
 
@@ -40,10 +40,25 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
         child_idx_map: std.AutoArrayHashMapUnmanaged(Idx, usize),
         // children_storage indexed by the usize returned from child_idx_map
         // children from one parent are stored together after the index so they may be taken as a slice
-        // children_storage stores ValueRefs for local operations, i32 for pow
+        // children_storage stores ValueRefs for local operations
         // stores tuple index of this vm in the mvm and other children for external operations
         children_storage: std.ArrayListUnmanaged(u32),
         expr_lists: std.AutoArrayHashMapUnmanaged(ValueRef, []ValueRef),
+
+        fn nanBP(vector: anytype) void {
+            if (mode != .Debug) return;
+            if (data_is_scalar) return;
+            const nan_cond = vector != vector;
+            const inf_cond = blk: {
+                const is_inf = @abs(vector) == @as(@TypeOf(vector), @splat(std.math.inf(Scalar)));
+                const num_infs = @reduce(.Add, @select(Scalar, is_inf, @as(@TypeOf(vector), @splat(1)), @as(@TypeOf(vector), @splat(0))));
+                break :blk num_infs > 0;
+            };
+            if (@reduce(.Or, nan_cond) or inf_cond) {
+                std.debug.print("{} contains nonnormal values", .{vector});
+                @breakpoint();
+            }
+        }
 
         const Self = @This();
 
@@ -139,6 +154,16 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 std.debug.panic("Failed to exponentiate ref {}: {}", .{ ref, err });
             };
         }
+        pub fn log(self: *Self, ref: ValueRef) ValueRef {
+            return self.newExpr(.log, @log(self.getData(ref)), &[_]u32{@bitCast(ref)}) catch |err| {
+                std.debug.panic("Failed to calculate logarithm for ref {}: {}", .{ ref, err });
+            };
+        }
+        pub fn sqrt(self: *Self, ref: ValueRef) ValueRef {
+            return self.newExpr(.sqrt, @sqrt(self.getData(ref)), &[_]u32{@bitCast(ref)}) catch |err| {
+                std.debug.panic("Failed to calculate square root for ref {}: {}", .{ ref, err });
+            };
+        }
         pub fn neg(self: *Self, ref: ValueRef) ValueRef {
             return self.newExpr(.neg, -self.getData(ref), &[_]u32{@bitCast(ref)}) catch |err| {
                 std.debug.panic("Failed to negate ref {}: {}", .{ ref, err });
@@ -160,7 +185,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
             defer to_travel.deinit();
 
             var curr_ref = ref;
-            op: switch (curr_ref.op) {
+            return op: switch (curr_ref.op) {
                 .external_sum, .external_max, .external_splat => {
                     externals.append(curr_ref) catch unreachable;
                     continue :op .noop;
@@ -168,7 +193,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 .noop => if (to_travel.pop()) |r| {
                     curr_ref = r;
                     continue :op curr_ref.op;
-                } else return externals.toOwnedSlice() catch unreachable,
+                } else externals.toOwnedSlice() catch unreachable,
 
                 .add, .mul, .max => {
                     const c = self.children_storage.items[self.child_idx_map.get(curr_ref.idx).?..];
@@ -177,12 +202,12 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                     continue :op curr_ref.op;
                 },
                 _ => continue :op .neg,
-                .exp, .neg => {
+                .exp, .neg, .log, .sqrt => {
                     const c = self.children_storage.items[self.child_idx_map.get(curr_ref.idx).?..];
                     curr_ref = @bitCast(c[0]);
                     continue :op curr_ref.op;
                 },
-            }
+            };
         }
 
         pub fn getLocalChildren(self: *Self, ref: ValueRef) []ValueRef {
@@ -190,7 +215,7 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 .noop, .external_sum, .external_splat, .external_max => @panic(".noop and external operators have no local children"),
                 .add, .mul, .max => 2,
                 _ => 1,
-                .exp, .neg => 1,
+                .exp, .neg, .log, .sqrt => 1,
             };
             return @ptrCast(self.children_storage.items[self.child_idx_map.get(ref.idx).?..][0..num_children]);
         }
@@ -218,16 +243,28 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 .max => @max(self.getData(c[0]), self.getData(c[1])),
                 .exp => @exp(self.getData(c[0])),
                 .neg => -self.getData(c[0]),
+                .log => @log(self.getData(c[0])),
+                .sqrt => @sqrt(self.getData(c[0])),
                 _ => blk: {
                     const num = @as(PowInt, @intCast(@intFromEnum(ref.op) >> op_without_int_size));
                     const d = self.getData(c[0]);
-                    var result: Data = one;
-                    for (0..@abs(num)) |_| {
-                        result *= d;
+                    if (num == -1) {
+                        break :blk one / d;
+                    } else {
+                        var result: Data = one;
+                        for (0..@abs(num)) |_| {
+                            result *= d;
+                        }
+                        break :blk if (std.math.sign(num) == -1) one / result else result;
                     }
-                    break :blk if (std.math.sign(num) == -1) one / result else result;
                 },
             };
+            nanBP(data.*);
+        }
+
+        fn isSubExpr(self: *const Self, super: ValueRef, ref: ValueRef) bool {
+            const expr_list = self.expr_lists.get(super).?;
+            if (std.mem.indexOfScalar(ValueRef, expr_list, ref)) |_| true else false;
         }
 
         // TODO ability to hold multiple expressions
@@ -284,10 +321,12 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                 .add => {
                     self.grad_storage.items[@intFromEnum(c[0].idx)] += curr_grad;
                     self.grad_storage.items[@intFromEnum(c[1].idx)] += curr_grad;
+                    nanBP(self.grad_storage.items[@intFromEnum(c[1].idx)]);
                 },
                 .mul => {
                     self.grad_storage.items[@intFromEnum(c[0].idx)] += self.getData(c[1]) * curr_grad;
                     self.grad_storage.items[@intFromEnum(c[1].idx)] += self.getData(c[0]) * curr_grad;
+                    nanBP(self.grad_storage.items[@intFromEnum(c[1].idx)]);
                 },
                 .max => {
                     const selected0 = self.getData(c[0]) == self.getData(ref);
@@ -298,15 +337,25 @@ pub fn ValueManager(Scalar: type, vector_size: comptime_int) type {
                         self.grad_storage.items[@intFromEnum(c[0].idx)] += @select(Scalar, selected0, curr_grad, @as(Data, @splat(0)));
                         self.grad_storage.items[@intFromEnum(c[1].idx)] += @select(Scalar, selected0, @as(Data, @splat(0)), curr_grad);
                     }
+                    nanBP(self.grad_storage.items[@intFromEnum(c[1].idx)]);
                 },
                 .exp => self.grad_storage.items[@intFromEnum(c[0].idx)] += self.getData(ref) * curr_grad,
                 .neg => self.grad_storage.items[@intFromEnum(c[0].idx)] -= curr_grad,
+                .log => self.grad_storage.items[@intFromEnum(c[0].idx)] += curr_grad / self.getData(c[0]),
+                .sqrt => self.grad_storage.items[@intFromEnum(c[0].idx)] += (if (data_is_scalar) 0.5 else @as(Data, @splat(0.5))) * (curr_grad / @sqrt(self.getData(c[0]))),
                 _ => {
-                    const num = @as(PowInt, @intCast(@intFromEnum(ref.op) >> op_without_int_size));
+                    const num = @as(PowInt, @intCast(@as(i8, @intFromEnum(ref.op)) >> op_without_int_size));
                     const data_num: Data = if (data_is_scalar) @floatFromInt(num) else @splat(@floatFromInt(num));
-                    self.grad_storage.items[@intFromEnum(c[0].idx)] += data_num * (self.getData(ref) / self.getData(c[0])) * curr_grad;
+                    const d = self.getData(c[0]);
+                    var result: Data = one;
+                    for (0..@abs(num - 1)) |_| {
+                        result *= d;
+                    }
+                    result = if (std.math.sign(num - 1) == -1) one / result else result;
+                    self.grad_storage.items[@intFromEnum(c[0].idx)] += data_num * result * curr_grad;
                 },
             }
+            nanBP(self.grad_storage.items[@intFromEnum(c[0].idx)]);
         }
 
         pub fn backwardWithGrad(self: *Self, ref: ValueRef, grad: ?Data) !void {

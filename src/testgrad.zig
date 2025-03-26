@@ -1,10 +1,11 @@
 const std = @import("std");
 const grad = @import("grad.zig");
 const manygrad = @import("manygrad.zig");
+const nn = @import("nn.zig");
 const ManyValueManager = manygrad.ManyValueManager;
 const ValueManager = grad.ValueManager;
 
-const APPROX = 0.001;
+const APPROX = 1e-4;
 
 test "Vector Collection Size" {
     try std.testing.expectEqual(16, @sizeOf(@Vector(4, f32)));
@@ -86,6 +87,42 @@ test "ValueManager Exponentiation Test" {
     try std.testing.expectApproxEqAbs(4, vm.getGrad(a), APPROX);
     try std.testing.expectApproxEqAbs(4, vm.getGrad(b), APPROX);
     try std.testing.expectApproxEqAbs(4, vm.getGrad(c), APPROX);
+}
+test "ValueManager Logarithm Test" {
+    var vm = try ValueManager(f32, 0).init(std.testing.allocator, 10);
+    defer vm.deinit();
+
+    const a = vm.new(@exp(2.0));
+    const b = vm.new(@exp(3.0));
+
+    const c = vm.mul(a, b);
+    try std.testing.expectApproxEqAbs(@exp(2.0) * @exp(3.0), vm.getData(c), APPROX);
+
+    const d = vm.log(c);
+    try std.testing.expectApproxEqAbs(5, vm.getData(d), APPROX);
+
+    vm.backward(d);
+    try std.testing.expectApproxEqAbs(1 / vm.getData(a), vm.getGrad(a), APPROX);
+    try std.testing.expectApproxEqAbs(1 / vm.getData(b), vm.getGrad(b), APPROX);
+    try std.testing.expectApproxEqAbs(1 / vm.getData(c), vm.getGrad(c), APPROX);
+}
+test "ValueManager Square Root Test" {
+    var vm = try ValueManager(f32, 0).init(std.testing.allocator, 10);
+    defer vm.deinit();
+
+    const a = vm.new(4.0);
+    const b = vm.new(16.0);
+
+    const c = vm.mul(a, b);
+    try std.testing.expectApproxEqAbs(64.0, vm.getData(c), APPROX);
+
+    const d = vm.sqrt(c);
+    try std.testing.expectApproxEqAbs(8, vm.getData(d), APPROX);
+
+    vm.backward(d);
+    try std.testing.expectApproxEqAbs(1, vm.getGrad(a), APPROX);
+    try std.testing.expectApproxEqAbs(1.0 / 4.0, vm.getGrad(b), APPROX);
+    try std.testing.expectApproxEqAbs(1.0 / 16.0, vm.getGrad(c), APPROX);
 }
 
 test "ValueManager Power Raising Test" {
@@ -582,6 +619,7 @@ test "ManyValueManager Backward Test" {
     }
 }
 
+// doesn't use log cuz I'm lazy
 test "ManyValueManager Operations Test" {
     const V4 = @Vector(4, f32);
     const V3 = @Vector(3, f32);
@@ -731,7 +769,7 @@ test "ManyValueManager Max Operation" {
     try mvm.backward(z);
     inline for (0..columns) |column| {
         try std.testing.expectApproxEqAbs(if (column == 1 or column == 2) 3 else 4, mvm.getData(z)[0][column], APPROX);
-        try std.testing.expectApproxEqAbs(if (column == 2 or column == 3) 1 else 0, mvm.getGrad(x)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(if (column == 0 or column == 1) 0 else 1, mvm.getGrad(x)[0][column], APPROX);
         try std.testing.expectApproxEqAbs(if (column == 0 or column == 1) 1 else 0, mvm.getGrad(y)[0][column], APPROX);
     }
 }
@@ -749,5 +787,106 @@ test "MVM values with shape of" {
         inline for (0..columns) |column| {
             try std.testing.expect(if (column == 0) mvm.getData(x)[row][column] == mvm.getData(y)[row][column] else mvm.getData(x)[row][column] != mvm.getData(y)[row][column]);
         }
+    }
+}
+
+test "Activation Functions" {
+    const V3 = @Vector(3, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{ 3, 1 }).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const x = mvm.newColumn(V3{ 1, 2, 8 });
+    const soft = nn.softmaxSafe(*@TypeOf(mvm), @TypeOf(x), &mvm, x);
+    const y = mvm.newColumn(V3{ 0.5, 1, 2 });
+    const sig = nn.sigmoid(*@TypeOf(mvm), @TypeOf(y), &mvm, y);
+    const z = mvm.add(soft, sig);
+    try mvm.backward(z);
+
+    try std.testing.expectApproxEqAbs(1.0 / (1.0 + (1.0 / @sqrt(std.math.e))), mvm.getData(sig)[0][0], APPROX);
+    try std.testing.expectApproxEqAbs(1.0 / (1.0 + (1.0 / std.math.e)), mvm.getData(sig)[0][1], APPROX);
+    try std.testing.expectApproxEqAbs(1.0 / (1.0 + (1.0 / (std.math.e * std.math.e))), mvm.getData(sig)[0][2], APPROX);
+
+    try std.testing.expectApproxEqAbs(0.001, mvm.getData(soft)[0][0], APPROX);
+    try std.testing.expectApproxEqAbs(0.0025, mvm.getData(soft)[0][1], APPROX);
+    try std.testing.expectApproxEqAbs(0.9966, mvm.getData(soft)[0][2], APPROX);
+}
+
+test "Mat Vec Mul Backward" {
+    const V4 = @Vector(4, f32);
+    const V3 = @Vector(3, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{ 3, 4 }).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const rows = 3;
+    const columns = 4;
+    const x = mvm.manyNewRows([rows]V4{ V4{ -2, 2, 3, 4 }, V4{ 1, -2, 3, 4 }, V4{ 1, 2, -2, 4 } });
+    const y = mvm.newColumn(V4{ 1, 2, 1, 0 });
+    const z = mvm.matVecMul(x, y);
+    try std.testing.expectEqual(manygrad.ManyRef(3, 1, .by_column), @TypeOf(z));
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(if (row == 0) 5 else if (row == 1) 0 else 3, mvm.getData(z)[0][row], APPROX);
+    }
+    try mvm.backward(z);
+    inline for (0..columns) |column| {
+        try std.testing.expectApproxEqAbs(mvm.getData(x)[0][column] + mvm.getData(x)[1][column] + mvm.getData(x)[2][column], mvm.getGrad(y)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[1][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[2][column], APPROX);
+        try std.testing.expectApproxEqAbs(if (column == 2) 1 else if (column == 3) 0 else column + 1, mvm.getGrad(x)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(if (column == 2) 1 else if (column == 3) 0 else column + 1, mvm.getGrad(x)[1][column], APPROX);
+        try std.testing.expectApproxEqAbs(if (column == 2) 1 else if (column == 3) 0 else column + 1, mvm.getGrad(x)[2][column], APPROX);
+    }
+    mvm.zeroGrad();
+    mvm.getDataPtr(x)[0][0] = 0;
+    try mvm.forward(z);
+    try mvm.backward(z);
+
+    inline for (0..columns) |column| {
+        try std.testing.expectApproxEqAbs(mvm.getData(x)[0][column] + mvm.getData(x)[1][column] + mvm.getData(x)[2][column], mvm.getGrad(y)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[1][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[2][column], APPROX);
+    }
+    mvm.zeroGrad();
+
+    const d = mvm.newColumn(V3{ 1, 1, 1 });
+    const end = mvm.add(d, z);
+    try mvm.backward(end);
+
+    inline for (0..columns) |column| {
+        try std.testing.expectApproxEqAbs(mvm.getData(x)[0][column] + mvm.getData(x)[1][column] + mvm.getData(x)[2][column], mvm.getGrad(y)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[0][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[1][column], APPROX);
+        try std.testing.expectApproxEqAbs(mvm.getData(y)[0][column], mvm.getGrad(x)[2][column], APPROX);
+    }
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(1, mvm.getGrad(d)[0][row], APPROX);
+    }
+}
+
+test "Large Input Softmax" {
+    const V50 = @Vector(50, f32);
+    var mvm = try ManyValueManager(f32, &[_]comptime_int{ 50, 1 }).init(std.testing.allocator, 10);
+    defer mvm.deinit();
+
+    const rows = 50;
+
+    const ref = mvm.newColumn(@as(V50, @splat(400)));
+    const max_input: manygrad.ManyRef(1, 1, .by_row) = mvm.maxColumns(ref);
+    const norm_x = mvm.sub(ref, mvm.splatIntoColumns(rows, max_input));
+    const ex = mvm.elemExp(norm_x);
+    const sum_ex = mvm.sumColumns(ex);
+    const result = mvm.elemDiv(ex, mvm.splatIntoColumns(rows, sum_ex));
+
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(0, mvm.getData(norm_x)[0][row], APPROX);
+        try std.testing.expectApproxEqAbs(1.0 / 50.0, mvm.getData(result)[0][row], APPROX);
+    }
+    inline for (0..rows) |row| {
+        mvm.getDataPtr(ref)[0][row] += row;
+    }
+    try mvm.forward(result);
+    inline for (0..rows) |row| {
+        try std.testing.expectApproxEqAbs(@as(isize, @intCast(row)) + 1 - rows, mvm.getData(norm_x)[0][row], APPROX);
     }
 }

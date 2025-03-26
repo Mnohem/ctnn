@@ -1,4 +1,5 @@
 const std = @import("std");
+const mode = @import("builtin").mode;
 const grad = @import("grad.zig");
 const ValueManager = grad.ValueManager;
 const ValueRef = grad.ValueRef;
@@ -39,20 +40,29 @@ pub fn ManyRef(m: comptime_int, n: comptime_int, o: Orientation) type {
 test "Ensure ManyRef Size" {
     std.debug.assert(@sizeOf(ManyRef(0, 0, .by_column)) == 4);
 }
+fn reconstruct(comptime num_vectors: usize, comptime vector_size: usize, comptime oriented: Orientation, val_ref: ValueRef) ManyRef(switch (oriented) {
+    .by_row => num_vectors,
+    .by_column => vector_size,
+}, switch (oriented) {
+    .by_row => vector_size,
+    .by_column => num_vectors,
+}, oriented) {
+    return .{ .val_ref = val_ref };
+}
 // Assume each value in vector_size is unique
-pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
-    switch (@typeInfo(Scalar)) {
+pub fn ManyValueManager(NumType: type, vector_sizes: []const comptime_int) type {
+    switch (@typeInfo(NumType)) {
         .float => {},
         else => @compileError("Scalar type must be float"),
     }
     comptime var vector_list: [vector_sizes.len]type = undefined;
     inline for (0..vector_sizes.len) |i| {
-        vector_list[i] = @Vector(vector_sizes[i], Scalar);
+        vector_list[i] = @Vector(vector_sizes[i], NumType);
     }
 
     comptime var vm_list: [vector_sizes.len]type = undefined;
     inline for (0..vector_sizes.len) |i| {
-        vm_list[i] = ValueManager(Scalar, vector_sizes[i]);
+        vm_list[i] = ValueManager(NumType, vector_sizes[i]);
     }
     const Vms = std.meta.Tuple(&vm_list);
 
@@ -64,7 +74,21 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
         const Self = @This();
         const TermId = struct { u32, ValueRef };
         const _ = std.debug.assert(@sizeOf(TermId) == 8);
+        pub const Scalar = NumType;
 
+        fn nanBP(vector: anytype) void {
+            if (mode != .Debug) return;
+            const nan_cond = vector != vector;
+            const inf_cond = blk: {
+                const is_inf = @abs(vector) == @as(@TypeOf(vector), @splat(std.math.inf(Scalar)));
+                const num_infs = @reduce(.Add, @select(Scalar, is_inf, @as(@TypeOf(vector), @splat(1)), @as(@TypeOf(vector), @splat(0))));
+                break :blk num_infs > 0;
+            };
+            if (@reduce(.Or, nan_cond) or inf_cond) {
+                std.debug.print("{} contains nonnormal values", .{vector});
+                @breakpoint();
+            }
+        }
         // returns the idx for which vm this vector is in
         fn validateVector(Vec: type) comptime_int {
             inline for (vector_list, 0..) |Vector, i| {
@@ -72,7 +96,7 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                     return i;
                 }
             } else {
-                @compileError(std.fmt.comptimePrint("There is no ValueManager for vector {d}", .{Vec}));
+                @compileError(std.fmt.comptimePrint("There is no ValueManager for vector {}", .{Vec}));
             }
         }
         fn refVmIdx(orientation: Orientation, rows: comptime_int, columns: comptime_int) comptime_int {
@@ -97,19 +121,25 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             }
         }
 
-        pub fn getData(self: *Self, ref: anytype) switch (ref.oriented) {
+        pub fn getData(self: *const Self, ref: anytype) switch (ref.oriented) {
             .by_row => [ref.rows]@Vector(ref.columns, Scalar),
             .by_column => [ref.columns]@Vector(ref.rows, Scalar),
         } {
             const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
             return self.vms[vm_idx].data_storage.items[@intFromEnum(ref.val_ref.idx)..][0..@TypeOf(ref).numVectors()].*;
         }
-        pub fn getGrad(self: *Self, ref: anytype) switch (ref.oriented) {
+        pub fn getGrad(self: *const Self, ref: anytype) switch (ref.oriented) {
             .by_row => [ref.rows]@Vector(ref.columns, Scalar),
             .by_column => [ref.columns]@Vector(ref.rows, Scalar),
         } {
             const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
-            return self.vms[vm_idx].grad_storage.items[@intFromEnum(ref.val_ref.idx)..][0..@TypeOf(ref).numVectors()].*;
+            const vm_grad_storage = self.vms[vm_idx].grad_storage;
+            const start = @intFromEnum(ref.val_ref.idx);
+            const len = @TypeOf(ref).numVectors();
+            return if (vm_grad_storage.items.len >= start + len)
+                vm_grad_storage.items[start..][0..len].*
+            else
+                @splat(@splat(0.0));
         }
         pub fn getDataPtr(self: *Self, ref: anytype) switch (ref.oriented) {
             .by_row => *[ref.rows]@Vector(ref.columns, Scalar),
@@ -216,12 +246,13 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                     } else {
                         // TODO this branch requires testing, this runs when we are given a noncontiguous vector to splat
                         // should work with backward too but needs tests
-                        inline for (0..@TypeOf(ref).vectorSize()) |i| {
-                            const val_ref = ValueRef{ .op = ref.op, .idx = @enumFromInt(@intFromEnum(ref.val_ref.idx) + i) };
-                            _ = self.vms[parent_vm_idx].newExpr(.external_splat, @splat(self.vms[vm_idx].getData(val_ref)[0]), &([_]u32{ vm_idx, @bitCast(val_ref), 0 })) catch |err| {
-                                std.debug.panic("Could not splat into row from {}: {}", .{ ref, err });
-                            };
-                        }
+                        // inline for (0..@TypeOf(ref).vectorSize()) |i| {
+                        //     const val_ref = ValueRef{ .op = ref.op, .idx = @enumFromInt(@intFromEnum(ref.val_ref.idx) + i) };
+                        //     _ = self.vms[parent_vm_idx].newExpr(.external_splat, @splat(self.vms[vm_idx].getData(val_ref)[0]), &([_]u32{ vm_idx, @bitCast(val_ref), 0 })) catch |err| {
+                        //         std.debug.panic("Could not splat into row from {}: {}", .{ ref, err });
+                        //     };
+                        // }
+                        unreachable;
                     }
 
                     return .{ .val_ref = result, .oriented = .by_row };
@@ -248,12 +279,13 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                     } else {
                         // TODO this branch requires testing, this runs when we are given a noncontiguous vector to splat
                         // should work with backward too but needs tests
-                        inline for (0..@TypeOf(ref).vectorSize()) |i| {
-                            const val_ref = ValueRef{ .op = ref.op, .idx = @enumFromInt(@intFromEnum(ref.val_ref.idx) + i) };
-                            _ = self.vms[parent_vm_idx].newExpr(.external_splat, @splat(self.vms[vm_idx].getData(val_ref)[0]), &([_]u32{ vm_idx, @bitCast(val_ref), 0 })) catch |err| {
-                                std.debug.panic("Could not splat into column from {}: {}", .{ ref, err });
-                            };
-                        }
+                        // inline for (0..@TypeOf(ref).vectorSize()) |i| {
+                        //     const val_ref = ValueRef{ .op = ref.op, .idx = @enumFromInt(@intFromEnum(ref.val_ref.idx) + i) };
+                        //     _ = self.vms[parent_vm_idx].newExpr(.external_splat, @splat(self.vms[vm_idx].getData(val_ref)[0]), &([_]u32{ vm_idx, @bitCast(val_ref), 0 })) catch |err| {
+                        //         std.debug.panic("Could not splat into column from {}: {}", .{ ref, err });
+                        //     };
+                        // }
+                        unreachable;
                     }
 
                     return .{ .val_ref = result, .oriented = .by_column };
@@ -265,9 +297,9 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
         // This can be ensured by the user using self.reorient
         fn sameRefTypes(ref1: anytype, ref2: anytype) void {
             if (ref1.rows != ref2.rows or ref1.columns != ref2.columns) {
-                @compileError(std.fmt.comptimePrint("{} and {} are not the same shape", .{ ref1, ref2 }));
+                @compileError(std.fmt.comptimePrint("{} and {} are not the same shape", .{ @TypeOf(ref1), @TypeOf(ref2) }));
             } else if (ref1.oriented != ref2.oriented) {
-                @compileError(std.fmt.comptimePrint("{} and {} are not oriented the same way", .{ ref1, ref2 }));
+                @compileError(std.fmt.comptimePrint("{} and {} are not oriented the same way", .{ @TypeOf(ref1), @TypeOf(ref2) }));
             }
         }
         pub fn add(self: *Self, ref1: anytype, ref2: anytype) @TypeOf(ref1) {
@@ -377,6 +409,40 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
 
             return result;
         }
+        pub fn log(self: *Self, ref: anytype) @TypeOf(ref) {
+            const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
+
+            const result: @TypeOf(ref) = .{
+                .val_ref = ValueRef{
+                    .op = .log,
+                    .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
+                },
+                .oriented = ref.oriented,
+            };
+
+            for (0..@TypeOf(ref).numVectors()) |i| {
+                _ = self.vms[vm_idx].log(.{ .op = ref.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref.val_ref.idx) + i) });
+            }
+
+            return result;
+        }
+        pub fn sqrt(self: *Self, ref: anytype) @TypeOf(ref) {
+            const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
+
+            const result: @TypeOf(ref) = .{
+                .val_ref = ValueRef{
+                    .op = .sqrt,
+                    .idx = @enumFromInt(self.vms[vm_idx].data_storage.items.len),
+                },
+                .oriented = ref.oriented,
+            };
+
+            for (0..@TypeOf(ref).numVectors()) |i| {
+                _ = self.vms[vm_idx].sqrt(.{ .op = ref.val_ref.op, .idx = @enumFromInt(@intFromEnum(ref.val_ref.idx) + i) });
+            }
+
+            return result;
+        }
 
         pub fn neg(self: *Self, ref: anytype) @TypeOf(ref) {
             const vm_idx = refVmIdx(ref.oriented, ref.rows, ref.columns);
@@ -444,7 +510,7 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                     _ = self.vms[vm_id1].mul(.{ .op = ref1.val_ref.op, .idx = ref1_idx }, ref2.val_ref);
                 }
 
-                return self.sumRows(ManyRef(ref1.rows, ref2.rows, .by_row){
+                return self.sumRows(@TypeOf(ref1){
                     .val_ref = ValueRef{
                         .op = .mul,
                         .idx = start_idx,
@@ -517,8 +583,9 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             const vmi = refVmIdx(ref.oriented, ref.rows, ref.columns);
             const child_vm_idx, const child, const extra = self.vms[vmi].getExternalInfo(ref.val_ref);
 
-            inline for (&self.vms, 0..) |*cvm, cvm_idx| {
-                if (cvm_idx == child_vm_idx) {
+            switch (child_vm_idx) {
+                inline 0...vector_sizes.len - 1 => |cvm_idx| {
+                    const cvm = &self.vms[cvm_idx];
                     switch (ref.val_ref.op) {
                         .external_sum => {
                             for (cvm.data_storage.items[@intFromEnum(child.idx)..][0..@TypeOf(ref).vectorSize()], 0..) |vec, i| {
@@ -536,8 +603,8 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                         },
                         else => unreachable,
                     }
-                    break;
-                }
+                },
+                else => unreachable,
             }
         }
 
@@ -546,7 +613,6 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                 vm.zeroGrad();
             }
         }
-        // forward and backward is valid to call on a ref only after calling createExprGraph on that ref or any of its parents
         pub fn createExprGraph(self: *Self, ref: anytype) !void {
             const vmi = refVmIdx(ref.oriented, ref.rows, ref.columns);
 
@@ -562,34 +628,60 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
 
             var prev_index: usize = 0;
             while (prev_index != self.expr_graph.count()) {
-                const index = self.expr_graph.count();
-                for (self.expr_graph.keys()[prev_index..index], self.expr_graph.values()[prev_index..index]) |head_info, vm_local_externals| {
-                    const head_vm_idx, _ = head_info;
-                    std.debug.print("right before looping over vm_local_externals\n", .{});
-                    // compiler bug happens when iterating over tuple
-                    // vm_idx == head_vm_idx will evaluate to true when vm_idx = 1 and head_vm_idx = 3
-                    // does not occur in tests, only in debug builds of the nn
-                    // attempt to isolate and file bug report later
-                    for (vm_local_externals) |requested| inline for (&self.vms, 0..) |*vm, vm_idx| if (vm_idx == head_vm_idx) {
-                        const child_vm_idx, const child, _ = vm.getExternalInfo(requested);
+                var index = self.expr_graph.count();
+                var expr_graph_idx = prev_index;
+                while (expr_graph_idx < index) : (expr_graph_idx += 1) {
+                    const head_vm_idx, _ = self.expr_graph.keys()[expr_graph_idx];
+                    const vm_local_externals = self.expr_graph.values()[expr_graph_idx];
 
-                        inline for (&self.vms, 0..) |*cvm, cvm_idx| if (cvm_idx == child_vm_idx) switch (requested.op) {
-                            .external_sum, .external_max => for (0..vector_sizes[vm_idx]) |i| {
-                                const child_val_ref: ValueRef = .{ .op = child.op, .idx = @enumFromInt(@intFromEnum(child.idx) + i) };
-                                const entry = try self.expr_graph.getOrPut(.{ child_vm_idx, child_val_ref });
-                                if (!entry.found_existing) entry.value_ptr.* = cvm.externalParts(child_val_ref);
-                            },
-                            .external_splat => {
-                                const entry = try self.expr_graph.getOrPut(.{ child_vm_idx, child });
-                                if (!entry.found_existing) entry.value_ptr.* = cvm.externalParts(child);
+                    for (vm_local_externals) |requested| {
+                        switch (head_vm_idx) {
+                            inline 0...vector_sizes.len - 1 => |vm_idx| {
+                                const vm = &self.vms[vm_idx];
+                                const child_vm_idx, const child, _ = vm.getExternalInfo(requested);
+
+                                switch (child_vm_idx) {
+                                    inline 0...vector_sizes.len - 1 => |cvm_idx| {
+                                        const cvm = &self.vms[cvm_idx];
+                                        switch (requested.op) {
+                                            .external_sum, .external_max => for (0..vector_sizes[vm_idx]) |i| {
+                                                const child_val_ref: ValueRef = .{ .op = child.op, .idx = @enumFromInt(@intFromEnum(child.idx) + i) };
+                                                const key = .{ cvm_idx, child_val_ref };
+                                                const value = if (self.expr_graph.getIndex(key)) |idx| blk: {
+                                                    if (idx < index) index -= 1;
+                                                    if (idx < expr_graph_idx) expr_graph_idx -= 1;
+                                                    if (idx == expr_graph_idx) unreachable; // circular dependency
+                                                    break :blk self.expr_graph.fetchOrderedRemove(key).?.value;
+                                                } else cvm.externalParts(child_val_ref);
+                                                try self.expr_graph.putNoClobber(key, value);
+                                            },
+                                            .external_splat => {
+                                                const key = .{ cvm_idx, child };
+                                                const value = if (self.expr_graph.getIndex(key)) |idx| blk: {
+                                                    if (idx < index) index -= 1;
+                                                    if (idx < expr_graph_idx) expr_graph_idx -= 1;
+                                                    if (idx == expr_graph_idx) unreachable; // circular dependency
+                                                    break :blk self.expr_graph.fetchOrderedRemove(key).?.value;
+                                                } else cvm.externalParts(child);
+                                                try self.expr_graph.putNoClobber(key, value);
+                                            },
+                                            else => unreachable,
+                                        }
+                                    },
+                                    else => unreachable,
+                                }
                             },
                             else => unreachable,
-                        };
-                    };
+                        }
+                    }
                 }
                 prev_index = index;
             }
         }
+        // fn constructGraphRec(ref: anytype) void {
+        //     const vmi = refVmIdx(ref.oriented, ref.rows, ref.columns);
+        //     const vm_local_externals = self.vms[vmi].externalParts(ref);
+        // }
 
         pub fn forward(self: *Self, ref: anytype) !void {
             const vmi = refVmIdx(ref.oriented, ref.rows, ref.columns);
@@ -602,18 +694,20 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
             for (end..len) |i| {
                 const head_vm_idx, const expr_head = self.expr_graph.keys()[len - i - 1];
                 const vm_local_externals = self.expr_graph.values()[len - i - 1];
-                inline for (&self.vms, 0..) |*vm, vm_idx| {
-                    if (vm_idx == head_vm_idx) {
+                switch (head_vm_idx) {
+                    inline 0...vector_sizes.len - 1 => |vm_idx| {
+                        const vm = &self.vms[vm_idx];
                         for (vm_local_externals) |external| {
                             self.externalRecalculate(ManyRef(vector_sizes[vm_idx], 1, .by_column){ .val_ref = external });
                         }
 
                         try vm.forward(expr_head);
-                    }
+                    },
+                    else => unreachable,
                 }
             }
         }
-        pub fn backward(self: *Self, ref: anytype) !void {
+        pub fn backwardWithGrad(self: *Self, ref: anytype, init_g: Scalar) !void {
             const vmi = refVmIdx(ref.oriented, ref.rows, ref.columns);
 
             if (self.vms[vmi].grad_storage.items.len != self.vms[vmi].data_storage.items.len) {
@@ -623,25 +717,28 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                 self.vms[vmi].zeroGrad();
             }
             for (0..@TypeOf(ref).numVectors()) |i| {
-                self.vms[vmi].grad_storage.items[@intFromEnum(ref.val_ref.idx)..][i] = @splat(1);
+                self.vms[vmi].grad_storage.items[@intFromEnum(ref.val_ref.idx)..][i] = @splat(init_g);
             }
 
-            const start = if (self.expr_graph.getIndex(.{ vmi, ref.val_ref })) |idx| idx else blk: {
+            if (!self.expr_graph.contains(.{ vmi, ref.val_ref })) {
                 try self.createExprGraph(ref);
-                break :blk 0;
-            };
-            for (self.expr_graph.keys()[start..], self.expr_graph.values()[start..]) |key, value| {
+            }
+            for (self.expr_graph.keys(), self.expr_graph.values()) |key, value| {
                 const head_vm_idx, const expr_head = key;
                 const vm_local_externals = value;
-                inline for (&self.vms, 0..) |*vm, vm_idx| {
-                    if (vm_idx == head_vm_idx) {
+                switch (head_vm_idx) {
+                    inline 0...vector_sizes.len - 1 => |vm_idx| {
+                        const vm = &self.vms[vm_idx];
                         try vm.backwardWithGrad(expr_head, null);
 
                         for (vm_local_externals) |external| {
                             const child_vm_idx, const child, const extra = vm.getExternalInfo(external);
+                            const curr_grad = vm.getGrad(external);
+                            // if (@reduce(.And, curr_grad == @as(@TypeOf(curr_grad), @splat(0)))) @breakpoint();
 
-                            inline for (&self.vms, 0..) |*cvm, cvm_idx| {
-                                if (cvm_idx == child_vm_idx) {
+                            switch (child_vm_idx) {
+                                inline 0...vector_sizes.len - 1 => |cvm_idx| {
+                                    const cvm = &self.vms[cvm_idx];
                                     if (cvm.grad_storage.items.len != cvm.data_storage.items.len) {
                                         cvm.grad_storage.resize(self.allocator, cvm.data_storage.items.len) catch |err| {
                                             std.debug.panic("Failed to resize gradient: {}", .{err});
@@ -649,34 +746,82 @@ pub fn ManyValueManager(Scalar: type, vector_sizes: []const comptime_int) type {
                                         cvm.zeroGrad();
                                     }
 
-                                    const curr_grad = vm.getGrad(external);
                                     switch (external.op) {
                                         .external_sum => for (cvm.grad_storage.items[@intFromEnum(child.idx)..][0..vector_sizes[vm_idx]], 0..) |*g, i| {
                                             g.* += @splat(curr_grad[i]);
+                                            nanBP(g.*);
                                         },
                                         .external_max => for (cvm.grad_storage.items[@intFromEnum(child.idx)..][0..vector_sizes[vm_idx]], cvm.data_storage.items[@intFromEnum(child.idx)..][0..vector_sizes[vm_idx]], 0..) |*g, d, i| {
                                             // This is not mathematical as max is a discrete function
-                                            // Right now it is the naive solution, the max num is directly proportional, other nums have no effect (deriv of 0)
-                                            // If there are multiple equal max nums, we could balance the proportion between them, but we don't
-                                            const curr_max = vm.getDataPtr(external)[i];
+                                            // Right now it is the naive solution, the max num passes along its gradient, other nums have no effect
+                                            // If there are multiple equal maxes, we balance the proportion linearly between them
+                                            const curr_max = vm.getData(external)[i];
                                             const which_max = d == @as(@TypeOf(d), @splat(curr_max));
+                                            if (!@reduce(.Or, which_max)) @breakpoint();
+                                            // const num_max = @reduce(.Add, @select(Scalar, which_max, @as(@TypeOf(d), @splat(1)), @as(@TypeOf(d), @splat(0))));
                                             const unbalanced = @select(Scalar, which_max, @as(@TypeOf(d), @splat(curr_grad[i])), @as(@TypeOf(d), @splat(0)));
-                                            g.* += unbalanced; // / @as(@TypeOf(unbalanced), @splat(@reduce(.Add, unbalanced)));
+                                            g.* += unbalanced; // / @as(@TypeOf(d), @splat(num_max));
+                                            nanBP(g.*);
                                         },
                                         .external_splat => {
                                             const child_grad_ptr = &cvm.grad_storage.items[@intFromEnum(child.idx)];
                                             child_grad_ptr[extra[0]] += @reduce(.Add, curr_grad);
+                                            nanBP(child_grad_ptr.*);
                                         },
                                         else => unreachable,
                                     }
-                                    break;
-                                }
+                                },
+                                else => unreachable,
                             }
                         }
-                        break;
-                    }
+                    },
+                    else => unreachable,
                 }
             }
+        }
+
+        pub fn debugRef(self: *const Self, ref: anytype) void {
+            std.debug.print("Shape: {}\n", .{@TypeOf(ref)});
+            std.debug.print("Operation: {}\n", .{ref.val_ref.op});
+            std.debug.print("Data: {any}\n", .{self.getData(ref)});
+            std.debug.print("Gradient: {any}\n", .{self.getGrad(ref)});
+        }
+        pub fn treePrint(self: *const Self, ref: anytype, depth: usize) void {
+            for (0..depth) |_| {
+                std.debug.print("-", .{});
+            }
+            std.debug.print(" {}, {}({d})\n", .{ @TypeOf(ref), ref.val_ref.op, @intFromEnum(ref.val_ref.op) >> op_without_int_size });
+            const vmi = refVmIdx(ref.oriented, ref.rows, ref.columns);
+            var vm = self.vms[vmi];
+            op: switch (ref.val_ref.op) {
+                .noop => {},
+                inline .external_splat, .external_sum, .external_max => |op| {
+                    const child_vm_idx, const child, _ = vm.getExternalInfo(ref.val_ref);
+                    const child_orient = ref.transpose().oriented;
+                    const child_num_vectors = if (op == .external_splat) 1 else @TypeOf(ref).vectorSize();
+                    switch (child_vm_idx) {
+                        inline 0...vector_sizes.len - 1 => |idx| {
+                            const child_vector_size = vector_sizes[idx];
+                            const child_many_ref = reconstruct(child_num_vectors, child_vector_size, child_orient, child);
+                            self.treePrint(child_many_ref, depth + 1);
+                        },
+                        else => unreachable,
+                    }
+                },
+                .add, .mul, .max => {
+                    const children = vm.getLocalChildren(ref.val_ref);
+                    self.treePrint(@TypeOf(ref){ .val_ref = children[0] }, depth + 1);
+                    self.treePrint(@TypeOf(ref){ .val_ref = children[1] }, depth + 1);
+                },
+                _ => continue :op .neg,
+                .exp, .neg, .log, .sqrt => {
+                    const children = vm.getLocalChildren(ref.val_ref);
+                    self.treePrint(@TypeOf(ref){ .val_ref = children[0] }, depth + 1);
+                },
+            }
+        }
+        pub fn backward(self: *Self, ref: anytype) !void {
+            return self.backwardWithGrad(ref, 1);
         }
     };
 }
